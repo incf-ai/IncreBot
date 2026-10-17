@@ -1,0 +1,27 @@
+# Allowlist: the image build (deploy/Containerfile) only needs what
+# `cargo build --release -p increbot` reads. Everything else stays out, so bench
+# output, scratch target dirs and backups can't bloat or bust the COPY layer.
+# config.rsn and prompts/ are mounted at run time, not baked in; the build only
+# reads config.rsn for its persona_file, which build.rs embeds as the built-in
+# persona.
+# Podman won't re-include a file inside an excluded directory, so each parent
+# is re-included first and then trimmed back.
+*
+!.cargo
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!src
+!crates
+!config.rsn
+# Top-level persona files only, not prompts/legacy-*/.
+!prompts
+prompts/*
+!prompts/*.rsn
+# Declared as [[example]] targets in Cargo.toml; cargo wants the files present.
+!bench
+bench/*
+!bench/persona
+bench/persona/*
+!bench/persona/floob_bench.rs
+!bench/persona/persona_report.rs

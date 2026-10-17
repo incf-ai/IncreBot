@@ -1,0 +1,29 @@
+#version 460
+// Activations to 8 bits per 256-element block, like the CPU's Q8K
+// (packed_k.rs): scale d = amax / 127, values round(x / d), and the sum of
+// every 16 values. One workgroup of 64 per (row, block), 4 values each.
+// Outputs: q [m, k / 4] words of 4 int8, d [m, k / 256], s [m, k / 16].
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_clustered : require
+
+layout(local_size_x = 64) in;
+layout(push_constant) uniform P {
+    V4 x; U32 q; F32 d; U32 s;
+    uint k;
+} p;
+
+void main() {
+    uint row = gl_WorkGroupID.y, b = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x;
+    uint nb = p.k / 256;
+    uint at = row * p.k + b * 256 + tid * 4;
+    vec4 v = p.x.v[at / 4];
+    float amax = workgroup_max(max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w))));
+    float d = amax / 127.0;
+    float inv = d > 0.0 ? 1.0 / d : 0.0;
+    ivec4 q = ivec4(clamp(round(v * inv), -127.0, 127.0));
+    uvec4 u = uvec4(q) & 0xFFu;
+    p.q.v[at / 4] = u.x | (u.y << 8) | (u.z << 16) | (u.w << 24);
+    int sum = subgroupClusteredAdd(q.x + q.y + q.z + q.w, 4);
+    if (tid % 4 == 0) p.s.v[(row * p.k + b * 256) / 16 + tid / 4] = uint(sum);
+    if (tid == 0) p.d.v[row * nb + b] = d;
+}

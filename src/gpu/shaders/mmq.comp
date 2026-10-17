@@ -1,0 +1,214 @@
+#version 460
+// Y[t, n] (+)= X[t, k] · W[n, k]ᵀ for prefill with integer dot products, as the
+// CPU's packed kernels do: X quantized by quantize_q8k.comp, W's 4- or 6-bit
+// values as int8, 4-way int8 dot products (v_dot4) into int32, sub-block scales
+// applied in integers, floats once per half-block. -DQ4K or -DQ6K selects the
+// weight format (Q6_K repacked, common.glsl).
+//
+// Tiles: 128 weight rows × 64 tokens, k in half-blocks of 128. 256
+// invocations, each 8 rows × 4 tokens.
+#include "common.glsl"
+#extension GL_EXT_integer_dot_product : require
+
+#define BM 128
+#define BT 64
+#define WS 33  // words per weight row in shared memory (32 + 1 against bank conflicts)
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+#ifdef Q4K
+    U4 w;
+#else
+    U32 w;
+#endif
+    U4 xq; F32 xd; U32 xs; F32 y;
+    uint k; uint n; uint m; uint acc;
+} p;
+
+shared uint wq[BM * WS];
+shared int wsc[BM][8];   // Q4_K: 4 sub-block scales; Q6_K: 8 group scales
+shared int wmn[BM][4];   // Q4_K only
+shared float wd[BM], wdmin[BM];
+shared uvec4 xqs[BT][8];
+shared int xsum[BT][8];
+shared float xds[BT];
+
+void main() {
+    uint n0 = gl_WorkGroupID.x * BM, t0 = gl_WorkGroupID.y * BT;
+    uint tid = gl_LocalInvocationID.x;
+    uint tx = tid % 16, ty = tid / 16;
+    uint nb = p.k / 256;
+    float acc[8][4];
+    for (uint i = 0; i < 8; i++)
+        for (uint j = 0; j < 4; j++) acc[i][j] = 0.0;
+
+    for (uint kh = 0; kh < p.k / 128; kh++) {
+        uint b = kh / 2, h = kh % 2;
+        // Weights: two invocations per row, each unpacking 64 of the 128 values.
+        {
+            uint r = tid / 2, part = tid % 2, row = n0 + r;
+            if (row < p.n) {
+#ifdef Q4K
+                uint base = (row * nb + b) * 9;
+                uvec4 hd = p.w.v[base];
+                uint c = 2 * h + part;  // 64-weight chunk within the block
+                for (uint i = 0; i < 2; i++) {
+                    uvec4 qs = p.w.v[base + 1 + c * 2 + i];
+                    for (uint e = 0; e < 4; e++) {
+                        wq[r * WS + part * 16 + i * 4 + e] = qs[e] & 0x0F0F0F0Fu;
+                        wq[r * WS + part * 16 + 8 + i * 4 + e] = (qs[e] >> 4) & 0x0F0F0F0Fu;
+                    }
+                }
+                float sc, mn;
+                for (uint s = 0; s < 2; s++) {
+                    q4k_scale_min(2 * c + s, hd.yzw, sc, mn);
+                    wsc[r][part * 2 + s] = int(sc);
+                    wmn[r][part * 2 + s] = int(mn);
+                }
+                if (part == 0) {
+                    vec2 dm = unpackHalf2x16(hd.x);
+                    wd[r] = dm.x;
+                    wdmin[r] = dm.y;
+                }
+#else
+                uint blk = row * nb + b;
+                uint qb = blk * (Q6K_QS_BYTES / 4);
+                uint sb = (p.n * nb * Q6K_QS_BYTES + blk * Q6K_SC_BYTES) / 4;
+                // Positions l = part*16 .. +16 of each quarter q.
+                for (uint w4 = 0; w4 < 4; w4++) {
+                    uint l = part * 16 + w4 * 4;
+                    uint qa = p.w.v[qb + (h * 64 + l) / 4];
+                    uint qc = p.w.v[qb + (h * 64 + 32 + l) / 4];
+                    uint qh = p.w.v[qb + (128 + h * 32 + l) / 4];
+                    for (uint q = 0; q < 4; q++) {
+                        uint lo = ((q % 2 == 0 ? qa : qc) >> (q < 2 ? 0u : 4u)) & 0x0F0F0F0Fu;
+                        uint hi = ((qh >> (2 * q)) & 0x03030303u) << 4;
+                        wq[r * WS + (q * 32 + l) / 4] = lo | hi;
+                    }
+                }
+                uint s0 = p.w.v[sb + h * 2], s1 = p.w.v[sb + h * 2 + 1];
+                for (uint q = 0; q < 4; q++) {
+                    uint g = q * 2 + part;  // group of 16 within the half
+                    uint word = g < 4 ? s0 : s1;
+                    wsc[r][g] = sext8(BYTE_OF(word, g % 4));
+                }
+                if (part == 0) wd[r] = unpackHalf2x16(p.w.v[sb + 4]).x;
+#endif
+            } else {
+                for (uint i = 0; i < 16; i++) wq[r * WS + part * 16 + i] = 0u;
+                for (uint s = 0; s < 4; s++) wsc[r][part * 4 + s] = 0;
+                if (part == 0) {
+                    wd[r] = 0.0;
+                    wdmin[r] = 0.0;
+                }
+#ifdef Q4K
+                wmn[r][part * 2] = 0;
+                wmn[r][part * 2 + 1] = 0;
+#endif
+            }
+        }
+        // Activations: four invocations per token, two uvec4 each.
+        {
+            uint tt = tid / 4, part = tid % 4, tok = t0 + tt;
+            if (tok < p.m) {
+                uint at = (tok * p.k + kh * 128) / 16 + part * 2;
+                xqs[tt][part * 2] = p.xq.v[at];
+                xqs[tt][part * 2 + 1] = p.xq.v[at + 1];
+                for (uint g = part * 2; g < part * 2 + 2; g++)
+                    xsum[tt][g] = int(p.xs.v[(tok * p.k + kh * 128) / 16 + g]);
+                if (part == 0) xds[tt] = p.xd.v[tok * nb + b];
+            } else {
+                xqs[tt][part * 2] = uvec4(0);
+                xqs[tt][part * 2 + 1] = uvec4(0);
+                xsum[tt][part * 2] = 0;
+                xsum[tt][part * 2 + 1] = 0;
+                if (part == 0) xds[tt] = 0.0;
+            }
+        }
+        barrier();
+
+        int isum[8][4];
+        for (uint i = 0; i < 8; i++)
+            for (uint j = 0; j < 4; j++) isum[i][j] = 0;
+#ifdef Q4K
+        // 4 sub-blocks of 32 = 8 words each.
+        for (uint s = 0; s < 4; s++) {
+            int dots[8][4];
+            for (uint i = 0; i < 8; i++)
+                for (uint j = 0; j < 4; j++) dots[i][j] = 0;
+            for (uint w = 0; w < 2; w++) {
+                uvec4 xv[4];
+                for (uint j = 0; j < 4; j++) xv[j] = xqs[ty + 16 * j][s * 2 + w];
+                for (uint i = 0; i < 8; i++) {
+                    uint rb = (tx + 16 * i) * WS + s * 8 + w * 4;
+                    uvec4 wv = uvec4(wq[rb], wq[rb + 1], wq[rb + 2], wq[rb + 3]);
+                    for (uint j = 0; j < 4; j++) {
+                        int d = dots[i][j];
+                        d = dotPacked4x8AccSatEXT(int(wv.x), int(xv[j].x), d);
+                        d = dotPacked4x8AccSatEXT(int(wv.y), int(xv[j].y), d);
+                        d = dotPacked4x8AccSatEXT(int(wv.z), int(xv[j].z), d);
+                        d = dotPacked4x8AccSatEXT(int(wv.w), int(xv[j].w), d);
+                        dots[i][j] = d;
+                    }
+                }
+            }
+            for (uint i = 0; i < 8; i++) {
+                int sc = wsc[tx + 16 * i][s];
+                for (uint j = 0; j < 4; j++) isum[i][j] += sc * dots[i][j];
+            }
+        }
+        // The min term: Σ_s min_s · (sum of the sub-block's activations).
+        int xs32[4][4];
+        for (uint j = 0; j < 4; j++)
+            for (uint s = 0; s < 4; s++) xs32[j][s] = xsum[ty + 16 * j][2 * s] + xsum[ty + 16 * j][2 * s + 1];
+        for (uint i = 0; i < 8; i++) {
+            uint r = tx + 16 * i;
+            ivec4 mn = ivec4(wmn[r][0], wmn[r][1], wmn[r][2], wmn[r][3]);
+            float a = wd[r], z = wdmin[r];
+            for (uint j = 0; j < 4; j++) {
+                int msum = mn.x * xs32[j][0] + mn.y * xs32[j][1] + mn.z * xs32[j][2] + mn.w * xs32[j][3];
+                acc[i][j] += xds[ty + 16 * j] * (a * float(isum[i][j]) - z * float(msum));
+            }
+        }
+#else
+        // 8 groups of 16 = 4 words each.
+        for (uint g = 0; g < 8; g++) {
+            uvec4 xv[4];
+            int xs[4];
+            for (uint j = 0; j < 4; j++) {
+                xv[j] = xqs[ty + 16 * j][g];
+                xs[j] = 32 * xsum[ty + 16 * j][g];
+            }
+            for (uint i = 0; i < 8; i++) {
+                uint r = tx + 16 * i;
+                uint rb = r * WS + g * 4;
+                uvec4 wv = uvec4(wq[rb], wq[rb + 1], wq[rb + 2], wq[rb + 3]);
+                int sc = wsc[r][g];
+                for (uint j = 0; j < 4; j++) {
+                    int d = 0;
+                    d = dotPacked4x8AccSatEXT(int(wv.x), int(xv[j].x), d);
+                    d = dotPacked4x8AccSatEXT(int(wv.y), int(xv[j].y), d);
+                    d = dotPacked4x8AccSatEXT(int(wv.z), int(xv[j].z), d);
+                    d = dotPacked4x8AccSatEXT(int(wv.w), int(xv[j].w), d);
+                    isum[i][j] += sc * (d - xs[j]);
+                }
+            }
+        }
+        for (uint i = 0; i < 8; i++)
+            for (uint j = 0; j < 4; j++)
+                acc[i][j] += xds[ty + 16 * j] * wd[tx + 16 * i] * float(isum[i][j]);
+#endif
+        barrier();
+    }
+    for (uint j = 0; j < 4; j++) {
+        uint t = t0 + ty + 16 * j;
+        if (t >= p.m) continue;
+        for (uint i = 0; i < 8; i++) {
+            uint r = n0 + tx + 16 * i;
+            if (r >= p.n) continue;
+            float v = acc[i][j];
+            if (p.acc != 0) v += p.y.v[t * p.n + r];
+            p.y.v[t * p.n + r] = v;
+        }
+    }
+}

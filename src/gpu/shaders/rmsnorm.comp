@@ -1,0 +1,22 @@
+#version 460
+// y = x / rms(row) · w, one workgroup per row.
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    F32 x; F32 w; F32 y;
+    uint width; float eps;
+} p;
+
+void main() {
+    uint row = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x;
+    uint base = row * p.width;
+    float ss = 0.0;
+    for (uint i = tid; i < p.width; i += 256) {
+        float v = p.x.v[base + i];
+        ss += v * v;
+    }
+    ss = workgroup_sum(ss);
+    float inv = 1.0 / sqrt(ss / float(p.width) + p.eps);
+    for (uint i = tid; i < p.width; i += 256) p.y.v[base + i] = p.x.v[base + i] * inv * p.w.v[i];
+}

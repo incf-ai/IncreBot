@@ -1,0 +1,98 @@
+// increbot configuration (design.md §8). Every key can be overridden by an env
+// var named INCREBOT_<KEY> (key name only, no section), e.g. INCREBOT_THREADS=6.
+// List values in env vars are comma-separated IDs; enum values are lowercase
+// (INCREBOT_LINEAR_IMPL=dense). Optional structs: INCREBOT_DRY=none|on, and each
+// field as INCREBOT_DRY_<FIELD> (INCREBOT_DRY_MULTIPLIER=1.2, INCREBOT_REPEAT_LAST_N=128).
+
+Config {
+    model: Model {
+        repo:           "TheBloke/LLaMA2-13B-Tiefighter-GGUF",
+        file:           "llama2-13b-tiefighter.Q4_K_M.gguf",  // Q8_0: ~1.7x slower decode (design.md §3)
+        tokenizer_repo: "hf-internal-testing/llama-tokenizer",
+        n_ctx:          4096,
+        linear_impl:    Packed,   // Packed | Burn (reference, very slow) | Dense (small models only)
+    },
+
+    runtime: Runtime {
+        threads:        8,        // decode uses min(threads, 8) P-cores; above 8, prefill gets
+                                  // its own pool over P-cores, HT siblings, E-cores (design.md §4)
+        pin_threads:    true,     // measured: 2x prefill (design.md §3, §4)
+        kv_cache_slots: 2,
+        kv_cache_f16:   true,     // f16 halves KV memory; +4% decode at ~1,000 tokens with Q4_K_M (§3)
+        queue_depth:    2,        // replies waiting per channel; newer messages there are ignored when full
+        gpus:           [],       // GPUs by PCI address, preferred first; [] = CPU only.
+                                  //   [ Gpu { pci: "0000:06:00.0", name: "upper" },
+                                  //     Gpu { pci: "0000:03:00.0" } ]  // name optional
+                                  // Used only while no other program uses them (gpu-plan.md)
+        gpu_other_mib:    100,    // other programs' VRAM above this = the card is taken
+        gpu_poll_hz:      20,     // VRAM checks per second
+        gpu_holdoff_secs: 30,     // a taken card must be free this long before reuse; doubles on flaps
+        gpu_standby:      true,   // keep the weights on the next GPU too, as a warm fallback
+    },
+
+    generation: Generation {
+        max_prompt_tokens:  2560, // persona + template (~1170 with c53), the rest history
+        max_message_tokens: 120,  // per-message cap before "…"; must be < max_prompt_tokens / 2
+        max_header_tokens:  0,    // persona + template; 0 = half of max_prompt_tokens (1280)
+        cpu_drop_persona_repeat: true,  // no persona after the history while no GPU is ready:
+                                  // saves ~7 s of prefill per CPU reply (design.md §7)
+        timeout_secs:   140,      // per reply, from job start; 2 × timeout_secs <= 720 (an /ask waits
+                                  // behind at most 720 / timeout_secs − 1 jobs, else "busy")
+    },
+
+    discord: Discord {
+        bot_name:           "IncreBot",
+        persona_file:       "prompts/c53.rsn",  // how the bot replies: prompt, notes, word biases,
+                                      // sampler, reply length (persona-plan.md); /super-admin persona-reload re-reads it
+        optout_file:        "data/optouts.json",  // /opt-out list; written by the bot
+        history_messages:   20,   // floob remembers the last 10–20 messages (the anchor drops the older half)
+        stream_edits:       true,
+        // Discord IDs, each with an optional name. Names show in logs and errors as
+        // "name (id)"; nothing checks them against Discord. Developer Mode → right-click → Copy ID.
+        guilds:             [],   // allowlisted servers; empty = none
+                                  //   [ Guild { id: 123456789012345678, name: "My Server" } ]
+        dedicated_channels: [],   // channels (and their threads) where floob answers every message
+                                  //   [ Channel { id: 234567890123456789, name: "#floob" } ]
+        shared_channels:    [],   // channels (and their threads) where floob answers only @mentions
+                                  // and replies to its messages. Other channels are ignored.
+                                  // Both must be in allowlisted guilds.
+                                  //   [ Channel { id: 345678901234567890, name: "#general" },
+                                  //     Channel { id: 456789012345678901 } ]  // name optional
+        dm_users:           [],   // users allowed to DM the bot; empty = DMs ignored
+                                  //   [ User { id: 567890123456789012, name: "alice" } ]
+        admins:             [],   // users with admin rights everywhere, incl. DMs
+                                  //   [ User { id: 567890123456789012, name: "alice" } ]
+        novelty_key:        0x0000_0000_0000_0000,  // secret behind the fixed novelty commands
+                                  // (/hotdog-rater, …), e.g. from `openssl rand -hex 8`. Keep a backup:
+                                  // a new key re-rolls everyone. 0 works but is no secret.
+        notice_ttl_ms:      7500, // ephemeral refusals and "busy" delete themselves after this; 0 = never
+        retrying_ttl_ms:    3500, // the same for /retry's "Retrying…"
+        // How often someone not an admin may make floob generate by command (/ask, the
+        // novelty commands, /retry, /retry-batch; chatting doesn't count), across channels.
+        limits: Limits {
+            min_gap_ms:       5000,   // the least time between two
+            windows:          [ Window { count: 5, ms: 30000 }, Window { count: 15, ms: 120000 } ],
+                                      // at most `count` in any `ms`; a batch counts as one
+            // Gentle backoff on top of min_gap_ms: unit × (growth ^ pressure − 1), at most the cap.
+            // Each adds 1 pressure (a batch batch_cost); 1 drains every backoff_drain_ms.
+            backoff_unit_ms:  1000,
+            backoff_growth:   1.4,
+            backoff_drain_ms: 15000,
+            backoff_cap_ms:   45000,
+            batch_cost:       10.0,
+            admins_exempt:    false,  // true: admins skip these and the batch cooldown
+                                      // (/super-admin and "Admin actions" are never limited)
+        },
+        // The pause between a channel's replies to its messages (not slash commands), for
+        // everyone there: delay_ms, plus a backoff as above. Each message floob replies to
+        // adds 1 to the channel's pressure.
+        channel_limits: ChannelLimits {
+            delay_ms:         2000,
+            backoff_unit_ms:  1000,
+            backoff_growth:   1.4,
+            backoff_drain_ms: 10000,
+            backoff_cap_ms:   5000,    // so 2–7 s
+        },
+        // prompt_template: r#"..."#,  // minijinja; defaults to the Alpaca-style template in design.md §7
+    },
+}

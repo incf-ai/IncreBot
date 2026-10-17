@@ -1,0 +1,125 @@
+[package]
+name = "increbot"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace]
+members = [".", "crates/chatsim-core", "crates/chatsim-tui"]
+
+# Shared across every workspace member (each opts in with `[lints] workspace
+# = true`); covers each crate's lib, bins, examples, tests and benches alike.
+# A dropped `Result` (job channels, `Commands::dispatch`/`copy`, etc. —
+# panics-plan.md) now fails the build instead of a build-time warning no one
+# reads.
+[workspace.lints.rust]
+unused_must_use = "deny"
+# A match arm (or whole arm) the compiler can prove is never reached — e.g. a
+# `Kernel`/`ScalarKernel`-style split (panics-plan.md) where a future enum
+# variant stops lining up with its match. Catches the mistake at the call
+# site that stopped being exhaustive, not wherever the stale arm happens to
+# sit.
+unreachable_patterns = "deny"
+# `gpu/vk.rs` and `gpu/model.rs` already wrap every unsafe operation in its
+# own `unsafe { }` block with a `// SAFETY:` comment, even inside `unsafe
+# fn` bodies where that isn't required by default. This makes that habit a
+# compiler-enforced rule instead of a convention a future edit could quietly
+# stop following.
+unsafe_op_in_unsafe_fn = "deny"
+# `unused_crate_dependencies` was tried here and reverted: it fires per
+# compilation unit, and this package has many example/test/bench targets
+# that each use only a slice of its full `[dependencies]` list (e.g.
+# `bench/persona/floob_bench.rs` alone would need ~18 `#[allow]`s). It did
+# its one real job already — it found `thiserror`, unused anywhere in the
+# workspace, removed above — but keeping it on would mean allowing it back
+# almost everywhere, for no ongoing benefit. Worth an occasional manual
+# check (`RUSTFLAGS="-W unused_crate_dependencies" cargo build -p increbot
+# --lib`), not a permanent deny.
+
+[workspace.lints.clippy]
+# Debugging leftovers that should never ship.
+dbg_macro = "deny"
+unimplemented = "deny"
+# Assigning a lock guard to `_` drops it immediately, silently defeating the
+# lock it was meant to hold. Cheap insurance given how much `Mutex` this
+# codebase uses.
+let_underscore_lock = "deny"
+# `cli/mod.rs` deliberately splits `serve`'s logs (WARN+ to stderr, so
+# podman's journal doesn't show every line as red; everything else to
+# stdout) from `generate`/`inspect`'s direct terminal output. A stray
+# `println!`/`eprintln!` in the live bot's `discord`/`engine`/`gpu` code
+# would silently bypass that routing. `generate.rs`/`inspect.rs` (their
+# whole job) and test-only diagnostic prints are allowed back in locally.
+print_stdout = "deny"
+print_stderr = "deny"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Exact pins for pre-1.0 / unstable APIs woven into the code (design.md §9).
+burn = { version = "=0.22.0-pre.3", default-features = false, features = ["std", "flex"] }
+tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
+poise = "=0.7.0"
+# Raw Vulkan for the GPU backend (gpu-plan.md), loaded at run time: no link-time
+# dependency on libvulkan, so CPU-only hosts still run.
+ash = { version = "=0.38.0", default-features = false, features = ["loaded", "std"] }
+hf-hub = { version = "=0.4.3", default-features = false, features = ["ureq", "rustls-tls"] }
+
+# Novelty commands' fixed results (discord/seeded.rs): AES-256 under a configured key.
+aes = "0.8"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+gemm = "=0.19.0"           # same version burn-flex uses
+half = "2"
+libc = "0.2"
+memmap2 = "0.9"
+rand = "0.9"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# Alpha (0.x, "very early in development"): pinned like the other unstable deps.
+rsn = "=0.2.0"
+minijinja = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+# build.rs reads `discord.persona_file` from config.rsn (the built-in persona).
+rsn = "=0.2.0"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+proptest = "1"
+
+# Persona benchmark (bench/persona/README.md).
+[[example]]
+name = "floob_bench"
+path = "bench/persona/floob_bench.rs"
+
+[[example]]
+name = "persona_report"
+path = "bench/persona/persona_report.rs"
+
+# Smaller debug info: much less for the linker to write into each test binary.
+[profile.dev]
+debug = "line-tables-only"
+
+# Without this, debug builds of burn/gemm make even a test forward unusably slow.
+[profile.dev.package."*"]
+opt-level = 3
+
+# "*" covers dependencies only. Our own GGUF decode and forward pass, run by the
+# integration tests on real models, are just as slow unoptimized. Debug
+# assertions stay on, so the "run with --release" tests still skip.
+[profile.dev.package.increbot]
+opt-level = 2
+
+# No debug info in release builds (the deployed image included): it was ~150 MB
+# of the binary. strip also drops the copy that comes with the prebuilt std.
+[profile.release]
+debug = false
+strip = "debuginfo"

@@ -1,0 +1,15 @@
+[package]
+name = "hw-baseline"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+rayon = "1"
+gemm = "0.19"
+libc = "0.2"
+half = "2"
+
+[profile.release]
+opt-level = 3
+debug = false

@@ -1,0 +1,74 @@
+#version 460
+// Decode attention, split over the keys (flash-decoding): one workgroup per
+// (head, split) handles keys split·SPLIT_KEYS .. +SPLIT_KEYS of the single query
+// at position `past`, and writes its partial output with the max and the sum of
+// its exponentials. attention_merge.comp combines the splits.
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_clustered : require
+
+#define SPLIT_KEYS 128
+
+layout(local_size_x = 128) in;
+layout(push_constant) uniform P {
+    F32 q; U2 k; F16 v; F32 part_;
+    uint heads; uint kv_heads; uint head_dim; uint past;
+    float scale; uint splits;
+} p;
+
+shared float scores[SPLIT_KEYS];
+shared float qs[256];
+shared float acc[128];
+
+void main() {
+    uint h = gl_WorkGroupID.x, split = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+    uint hd = p.head_dim, kvw = p.kv_heads * hd;
+    uint kvh = h / (p.heads / p.kv_heads);
+    uint n = p.past + 1;
+    uint j0 = split * SPLIT_KEYS, j1 = min(n, j0 + SPLIT_KEYS);
+    for (uint e = tid; e < hd; e += 128) qs[e] = p.q.v[h * hd + e] * p.scale;
+    barrier();
+
+    // 16 invocations per key, 8 keys at a time.
+    uint lane = tid % 16, dpl = hd / 16;
+    for (uint j = j0 + tid / 16; j < j1; j += 8) {
+        uint at = (j * kvw + kvh * hd + lane * dpl) / 4;
+        float s = 0.0;
+        for (uint c = 0; c < dpl / 4; c++) {
+            uvec2 kk = p.k.v[at + c];
+            vec2 a = unpackHalf2x16(kk.x), b = unpackHalf2x16(kk.y);
+            uint e = lane * dpl + c * 4;
+            s += a.x * qs[e] + a.y * qs[e + 1] + b.x * qs[e + 2] + b.y * qs[e + 3];
+        }
+        s = subgroupClusteredAdd(s, 16);
+        if (lane == 0) scores[j - j0] = s;
+    }
+    barrier();
+
+    float mx = -1.0 / 0.0;
+    for (uint j = j0 + tid; j < j1; j += 128) mx = max(mx, scores[j - j0]);
+    mx = workgroup_max(mx);
+    float sum = 0.0;
+    for (uint j = j0 + tid; j < j1; j += 128) {
+        float e = exp(scores[j - j0] - mx);
+        scores[j - j0] = e;
+        sum += e;
+    }
+    sum = workgroup_sum(sum);
+
+    // Partial output: 128 / hd groups split the keys, then combine.
+    uint groups = 128 / hd, d = tid % hd, g = tid / hd;
+    float o = 0.0;
+    for (uint j = j0 + g; j < j1; j += groups) o += scores[j - j0] * float(p.v.v[j * kvw + kvh * hd + d]);
+    acc[tid] = o;
+    barrier();
+    // Layout per (head, split): hd outputs, then max, then sum.
+    uint base = (h * p.splits + split) * (hd + 2);
+    if (g == 0) {
+        for (uint gg = 1; gg < groups; gg++) o += acc[gg * hd + d];
+        p.part_.v[base + d] = o;
+    }
+    if (tid == 0) {
+        p.part_.v[base + hd] = mx;
+        p.part_.v[base + hd + 1] = sum;
+    }
+}

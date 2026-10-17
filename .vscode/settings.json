@@ -1,0 +1,12 @@
+{
+	// Code Spell Checker: check Markdown only.
+	"cSpell.enabledFileTypes": {
+		"*": false,
+		"markdown": true
+	},
+	// RSN config files: RON highlighting (a5huynh.vscode-ron) is a close match,
+	// and unlike "rust" it keeps rust-analyzer from graying them out.
+	"files.associations": {
+		"*.rsn": "ron"
+	}
+}

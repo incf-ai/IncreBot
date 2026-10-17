@@ -1,0 +1,76 @@
+{
+	"name": "increbot",
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
+	"features": {
+		"ghcr.io/devcontainers/features/node:1": {},
+		"ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {}
+	},
+	"workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+	"workspaceFolder": "/workspace",
+	"remoteUser": "vscode",
+	// The HF cache lives on the storage disk, shared with vllm-patched. The
+	// .env file holds DISCORD_TOKEN; create an empty one so --env-file
+	// doesn't fail on a fresh checkout.
+	"initializeCommand": "mkdir -p /mnt/storage/huggingface/hub && touch ${localWorkspaceFolder}/.env",
+	"containerEnv": {
+		"RUST_TEST_THREADS": "24",
+		"CARGO_BUILD_JOBS": "24",
+		"CLAUDE_CONFIG_DIR": "/home/vscode/.claude-config",
+		"HF_HOME": "/home/vscode/.cache/huggingface",
+		// Inference thread count (see design.md, "Threading"). The bot reads
+		// INCREBOT_THREADS; RAYON_NUM_THREADS is a fallback for any rayon
+		// work that runs before the bot builds its own pool.
+		"INCREBOT_THREADS": "22",
+		"RAYON_NUM_THREADS": "22",
+		// The bot's GPU preference: PCI addresses, first = preferred (gpu-plan.md).
+		// "GPU 1" (06:00.0) first, then "GPU 0" (03:00.0), then the CPU.
+		"INCREBOT_GPUS": "0000:06:00.0,0000:03:00.0"
+	},
+	"runArgs": [
+		"--name=devcontainer-increbot",
+		"--network=host",
+		// 13B Q8_0 weights take ~13.8 GB packed (~14.5 GB on Burn's i8 + f32-scale
+		// path), and the KV cache ~0.8 MB/token in f16 (~3.3 GB per full 4096-token
+		// context). 48 GB leaves room for several cached conversations and a
+		// release build running at the same time.
+		"--memory=48g",
+		// 22 inference threads, plus headroom for the tokio/Discord side.
+		"--cpus=24",
+		"--cap-drop=ALL",
+		// GPU backend (devcontainer-gpu.md): the GPU device nodes. All of /dev/dri,
+		// because node numbers can change between boots; the bot picks GPUs by PCI
+		// address and ignores the Intel iGPU.
+		"--device=/dev/dri",
+		// KFD: amd-smi and rocm-smi list ROCm processes (vLLM, ComfyUI) through it.
+		"--device=/dev/kfd",
+		// Rootless podman: keep the host user's video/render groups, which own the
+		// device nodes. Needs crun (podman's default runtime).
+		"--group-add=keep-groups",
+		// Host PID namespace: lets the bot and amd-smi see other containers'
+		// processes (/proc/<pid>/fdinfo), to name who is using a GPU.
+		"--pid=host",
+		"--env-file=${localWorkspaceFolder}/.env"
+	],
+	"mounts": [
+		"source=${localWorkspaceFolder}/.devcontainer/devcontainer.json,target=/workspace/.devcontainer/devcontainer.json,type=bind,readonly",
+		"source=${localWorkspaceFolder}/.devcontainer/Dockerfile,target=/workspace/.devcontainer/Dockerfile,type=bind,readonly",
+		"source=/mnt/storage/huggingface,target=/home/vscode/.cache/huggingface,type=bind",
+		"source=${localEnv:HOME}/.cache/huggingface/token,target=/home/vscode/.cache/huggingface/token,type=bind,readonly",
+		"source=increbot-claude-config,target=/home/vscode/.claude-config,type=volume",
+		"source=cargo-registry-cache,target=/usr/local/cargo/registry,type=volume"
+	],
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"rust-lang.rust-analyzer",
+				"tamasfe.even-better-toml"
+			],
+			"settings": {
+				"claudeCode.allowDangerouslySkipPermissions": true,
+				"claudeCode.initialPermissionMode": "bypassPermissions"
+			}
+		}
+	}
+}

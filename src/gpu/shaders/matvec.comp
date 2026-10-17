@@ -1,0 +1,126 @@
+#version 460
+// y = W · x for one activation row (decode), over up to three matrices at once
+// (Q, K and V share one dispatch). Each matrix is Q4_K (GGUF blocks as-is) or
+// Q6_K (repacked, see common.glsl). Two rows per workgroup, 32 invocations per
+// row, 8 per 256-weight block, so every invocation covers 32 weights with
+// 8- or 16-byte loads.
+//
+// glu = 1: matrices 0 and 1 are gate and up with the same row count; the
+// workgroup computes row r of both and writes silu(gate) · up to y0[r].
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 64) in;
+layout(push_constant) uniform P {
+    uint64_t w0; uint64_t w1; uint64_t w2;
+    V4 x;
+    F32 y0; F32 y1; F32 y2;
+    uint k; uint n0; uint n1; uint n2;
+    uint q6k; // bit i set: matrix i is Q6_K
+    uint acc; uint glu;
+} p;
+
+shared float res[2];
+
+float row_q4k(U4 w, uint row, uint nb, uint j) {
+    uint c = j / 2, l0 = (j % 2) * 16;
+    float sum = 0.0;
+    for (uint b = gl_LocalInvocationID.x % 32 / 8; b < nb; b += 4) {
+        uint base = (row * nb + b) * 9;
+        uvec4 hd = w.v[base];
+        uvec4 qs = w.v[base + 1 + j];
+        vec2 dm = unpackHalf2x16(hd.x);
+        float sc0, mn0, sc1, mn1;
+        q4k_scale_min(2 * c, hd.yzw, sc0, mn0);
+        q4k_scale_min(2 * c + 1, hd.yzw, sc1, mn1);
+        uint xb = (b * 256 + c * 64 + l0) / 4;
+        float dl = 0.0, dh = 0.0, sl = 0.0, sh = 0.0;
+        for (uint i = 0; i < 4; i++) {
+            uint q = qs[i];
+            vec4 xl = p.x.v[xb + i], xh = p.x.v[xb + 8 + i];
+            dl += dot(vec4(q & 15u, (q >> 8) & 15u, (q >> 16) & 15u, (q >> 24) & 15u), xl);
+            dh += dot(vec4((q >> 4) & 15u, (q >> 12) & 15u, (q >> 20) & 15u, q >> 28), xh);
+            sl += xl.x + xl.y + xl.z + xl.w;
+            sh += xh.x + xh.y + xh.z + xh.w;
+        }
+        sum += dm.x * (sc0 * dl + sc1 * dh) - dm.y * (mn0 * sl + mn1 * sh);
+    }
+    return sum;
+}
+
+float row_q6k(uint64_t addr, uint row, uint n, uint nb, uint j) {
+    U2 qs = U2(addr);
+    U32 sc = U32(addr + uint64_t(n) * nb * Q6K_QS_BYTES);
+    uint half_ = j / 4, l0 = (j % 4) * 8;
+    float sum = 0.0;
+    for (uint b = gl_LocalInvocationID.x % 32 / 8; b < nb; b += 4) {
+        uint blk = row * nb + b;
+        uint base = blk * (Q6K_QS_BYTES / 8);
+        uvec2 qa = qs.v[base + (half_ * 64 + l0) / 8];       // quarters 0 and 2
+        uvec2 qb = qs.v[base + (half_ * 64 + 32 + l0) / 8];  // quarters 1 and 3
+        uvec2 qh = qs.v[base + (128 + half_ * 32 + l0) / 8];
+        uint sb = blk * (Q6K_SC_BYTES / 4);
+        float d = unpackHalf2x16(sc.v[sb + 4]).x;
+        // Scales half*8 + q*2 + l0/16 for q = 0..3: bytes of words sb + half*2 (+1).
+        uint s0 = sc.v[sb + half_ * 2], s1 = sc.v[sb + half_ * 2 + 1];
+        uint hi = l0 / 16;
+        float scq[4] = float[4](
+            float(sext8(BYTE_OF(s0, hi))), float(sext8(BYTE_OF(s0, 2 + hi))),
+            float(sext8(BYTE_OF(s1, hi))), float(sext8(BYTE_OF(s1, 2 + hi))));
+        float bsum = 0.0;
+        for (uint q = 0; q < 4; q++) {
+            uvec2 lo = (q % 2 == 0) ? qa : qb;
+            uint shift = q < 2 ? 0u : 4u;
+            uint xb = (b * 256 + half_ * 128 + q * 32 + l0) / 4;
+            float s = 0.0;
+            for (uint h = 0; h < 2; h++) {
+                uint l4 = (lo[h] >> shift) & 0x0F0F0F0Fu;
+                uint h4 = ((qh[h] >> (2 * q)) & 0x03030303u) << 4;
+                uint v = l4 | h4;
+                vec4 wv = vec4(BYTE_OF(v, 0), BYTE_OF(v, 1), BYTE_OF(v, 2), BYTE_OF(v, 3)) - 32.0;
+                s += dot(wv, p.x.v[xb + h]);
+            }
+            bsum += scq[q] * s;
+        }
+        sum += d * bsum;
+    }
+    return sum;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x, half_wg = tid / 32, j = tid % 8;
+    uint nb = p.k / 256;
+    uint r = gl_WorkGroupID.x * 2 + half_wg;
+    uint mat, row;
+    if (p.glu != 0) {
+        mat = half_wg;
+        row = gl_WorkGroupID.x;
+    } else {
+        mat = r < p.n0 ? 0 : (r < p.n0 + p.n1 ? 1 : 2);
+        row = r - (mat > 0 ? p.n0 : 0) - (mat > 1 ? p.n1 : 0);
+    }
+    uint n = mat == 0 ? p.n0 : (mat == 1 ? p.n1 : p.n2);
+    bool valid = row < n;
+    uint64_t w = mat == 0 ? p.w0 : (mat == 1 ? p.w1 : p.w2);
+    float s = 0.0;
+    if (valid) {
+        if ((p.q6k & (1u << mat)) != 0) s = row_q6k(w, row, n, nb, j);
+        else s = row_q4k(U4(w), row, nb, j);
+    }
+    s = subgroupClusteredAdd(s, 32);
+    if (p.glu != 0) {
+        if (tid % 32 == 0) res[half_wg] = s;
+        barrier();
+        if (tid == 0 && valid) {
+            float g = res[0];
+            p.y0.v[row] = g / (1.0 + exp(-g)) * res[1];
+        }
+        return;
+    }
+    if (tid % 32 == 0 && valid) {
+        F32 y = mat == 0 ? p.y0 : (mat == 1 ? p.y1 : p.y2);
+        if (p.acc != 0) s += y.v[row];
+        y.v[row] = s;
+    }
+}

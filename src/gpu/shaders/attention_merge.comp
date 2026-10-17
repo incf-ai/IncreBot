@@ -1,0 +1,26 @@
+#version 460
+// Combines attention_split.comp's partial results: one workgroup per head,
+// one invocation per output dimension.
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    F32 part_; F32 out_;
+    uint head_dim; uint splits;
+} p;
+
+void main() {
+    uint h = gl_WorkGroupID.x, d = gl_LocalInvocationID.x, hd = p.head_dim;
+    if (d >= hd) return;
+    uint stride = hd + 2;
+    float mx = -1.0 / 0.0;
+    for (uint s = 0; s < p.splits; s++) mx = max(mx, p.part_.v[(h * p.splits + s) * stride + hd]);
+    float o = 0.0, sum = 0.0;
+    for (uint s = 0; s < p.splits; s++) {
+        uint base = (h * p.splits + s) * stride;
+        float w = exp(p.part_.v[base + hd] - mx);
+        o += p.part_.v[base + d] * w;
+        sum += p.part_.v[base + hd + 1] * w;
+    }
+    p.out_.v[h * hd + d] = o / sum;
+}

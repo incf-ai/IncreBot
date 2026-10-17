@@ -1,0 +1,26 @@
+/target
+tmp/
+.env
+*.gguf
+tools/*/target
+# Local bot deployment (run-bot.sh, your server's IDs, its logs)
+/run-bot.sh
+/config.local.rsn
+/logs
+# /opt-out list from local runs (discord.optout_file)
+/data
+# Build/scratch output
+/target-shake
+/mutants.out*
+__pycache__/
+# Bench inputs and output (scenarios, run.sh results, labels)
+bench/persona/scenarios/
+bench/persona/runs/
+bench/persona/labels/
+# Hand-made backups
+*.backup-*
+# Retired persona prompts
+/prompts/legacy-rsn/
+/prompts/legacy-txt/
+# Personal scratch notes
+/bench/persona/misc-notes.md

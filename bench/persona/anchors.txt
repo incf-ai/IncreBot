@@ -1,0 +1,6 @@
+# The hotdog rater's anchor replies (README, "Hotdog rater"). They calibrate
+# the raters, so no persona file may contain them, or anything close (checked
+# by `persona_report hotdog persona`). One per line.
+mew!! *sniffs and licks* oh, ack! its... uh.... not food. not food at all! nope, sorry incf. but it is... shiny?
+ooh a respectable bratwurst!! 13 cm is a proper size for grillin. *pokes it with the stick* very firm. u been takin good care of it!
+it's a fine sausage. 5.5 cm long and 7.0 cm around. good size.

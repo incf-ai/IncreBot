@@ -1,0 +1,120 @@
+#version 460
+// Causal attention for prefill, FlashAttention-style: one workgroup per (head,
+// block of 32 queries) walks the keys in tiles of 32 held in shared memory,
+// with an online softmax. q: [t, heads · hd] f32 (RoPE applied); k, v:
+// [n_ctx, kv_heads · hd] f16; out: [t, heads · hd]. Query i is at position
+// past + i. Four invocations per query: each computes 8 of a tile's scores and
+// keeps hd / 4 output dimensions.
+#include "common.glsl"
+#extension GL_KHR_shader_subgroup_clustered : require
+
+#define BQ 32
+#define BK 32
+#define HD 128      // largest head_dim supported
+#define ST (HD + 4) // shared row stride: keeps vec4 alignment, spreads banks
+
+layout(local_size_x = 128) in;
+layout(push_constant) uniform P {
+    F32 q; U4 k; U4 v; F32 out_;
+    uint heads; uint kv_heads; uint head_dim; uint past;
+    float scale; uint t;
+} p;
+
+shared vec4 qs[BQ * ST / 4];
+shared vec4 ks[BK * ST / 4];
+shared vec4 vs[BK * ST / 4];
+shared float ps[BQ][BK + 1];
+
+void main() {
+    uint h = gl_WorkGroupID.x, q0 = gl_WorkGroupID.y * BQ, tid = gl_LocalInvocationID.x;
+    uint hd = p.head_dim, hd4 = hd / 4, kvw = p.kv_heads * hd;
+    uint kvh = h / (p.heads / p.kv_heads);
+    uint qi = tid / 4, part = tid % 4;
+    uint nq = min(BQ, p.t - q0);
+
+    // Queries, pre-scaled.
+    for (uint e = tid; e < BQ * hd4; e += 128) {
+        uint r = e / hd4, c = e % hd4;
+        vec4 v = vec4(0.0);
+        if (r < nq) {
+            uint at = ((q0 + r) * p.heads + h) * hd + c * 4;
+            v = vec4(p.q.v[at], p.q.v[at + 1], p.q.v[at + 2], p.q.v[at + 3]) * p.scale;
+        }
+        qs[r * ST / 4 + c] = v;
+    }
+
+    uint my_pos = p.past + q0 + qi;  // this query's position
+    uint n_keys = p.past + q0 + nq;  // keys any query in the block sees
+    float m = -1.0 / 0.0, l = 0.0;
+    vec4 o[HD / 16];
+    for (uint e = 0; e < HD / 16; e++) o[e] = vec4(0.0);
+    uint dpp = hd / 4;  // output dimensions per invocation: part * dpp ..
+
+    for (uint j0 = 0; j0 < n_keys; j0 += BK) {
+        barrier();
+        // K and V tile: 8 halves (one uvec4) per load.
+        uint per_row = hd / 8;
+        for (uint e = tid; e < BK * per_row; e += 128) {
+            uint r = e / per_row, c = e % per_row;
+            uvec4 kk = uvec4(0), vv = uvec4(0);
+            if (j0 + r < n_keys) {
+                uint at = ((j0 + r) * kvw + kvh * hd) / 8 + c;
+                kk = p.k.v[at];
+                vv = p.v.v[at];
+            }
+            uint dst = r * ST / 4 + c * 2;
+            ks[dst] = vec4(unpackHalf2x16(kk.x), unpackHalf2x16(kk.y));
+            ks[dst + 1] = vec4(unpackHalf2x16(kk.z), unpackHalf2x16(kk.w));
+            vs[dst] = vec4(unpackHalf2x16(vv.x), unpackHalf2x16(vv.y));
+            vs[dst + 1] = vec4(unpackHalf2x16(vv.z), unpackHalf2x16(vv.w));
+        }
+        barrier();
+
+        // Scores for keys part + 4i.
+        float s[8];
+        for (uint i = 0; i < 8; i++) s[i] = 0.0;
+        for (uint c = 0; c < hd4; c++) {
+            vec4 qv = qs[qi * ST / 4 + c];
+            for (uint i = 0; i < 8; i++) s[i] += dot(qv, ks[(part + 4 * i) * ST / 4 + c]);
+        }
+        float mx = -1.0 / 0.0;
+        for (uint i = 0; i < 8; i++) {
+            uint j = j0 + part + 4 * i;
+            if (j > my_pos || qi >= nq) s[i] = -1.0 / 0.0;
+            mx = max(mx, s[i]);
+        }
+        mx = subgroupClusteredMax(mx, 4);
+        float m_new = max(m, mx);
+        float sum = 0.0;
+        for (uint i = 0; i < 8; i++) {
+            float e = m_new == -1.0 / 0.0 ? 0.0 : exp(s[i] - m_new);
+            ps[qi][part + 4 * i] = e;
+            sum += e;
+        }
+        sum = subgroupClusteredAdd(sum, 4);
+        float corr = m == -1.0 / 0.0 ? 0.0 : exp(m - m_new);
+        l = l * corr + sum;
+        m = m_new;
+        for (uint e = 0; e < dpp / 4; e++) o[e] *= corr;
+        barrier();
+
+        uint kmax = min(BK, n_keys - j0);
+        for (uint kj = 0; kj < kmax; kj++) {
+            float pj = ps[qi][kj];
+            uint vb = kj * ST / 4 + part * dpp / 4;
+            for (uint e = 0; e < dpp / 4; e++) o[e] += pj * vs[vb + e];
+        }
+    }
+
+    if (qi < nq) {
+        uint at = ((q0 + qi) * p.heads + h) * hd + part * dpp;
+        float inv = 1.0 / l;
+        for (uint e = 0; e < dpp / 4; e++) {
+            vec4 r = o[e] * inv;
+            p.out_.v[at + e * 4] = r.x;
+            p.out_.v[at + e * 4 + 1] = r.y;
+            p.out_.v[at + e * 4 + 2] = r.z;
+            p.out_.v[at + e * 4 + 3] = r.w;
+        }
+    }
+}

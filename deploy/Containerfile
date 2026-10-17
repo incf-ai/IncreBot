@@ -1,0 +1,33 @@
+# The service image (deploy.md). Build from the repo root:
+#   podman build -f deploy/Containerfile -t increbot:latest --build-arg GIT_COMMIT=... .
+FROM docker.io/library/rust:1.98-trixie AS build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends clang mold glslc \
+ && rm -rf /var/lib/apt/lists/*
+ENV INCREBOT_GPU_SHADERS_REQUIRED=1
+WORKDIR /src
+# .git isn't in the build context, so the commit comes in as a build argument
+# (shown by /version, /stats and --version).
+ARG GIT_COMMIT=unknown
+ENV INCREBOT_GIT_COMMIT=$GIT_COMMIT
+COPY . .
+# Cache mounts keep crates and build output between image builds.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked -p increbot \
+ && cp target/release/increbot /increbot
+
+FROM docker.io/library/debian:trixie-slim
+# mesa-vulkan-drivers: RADV, the Vulkan driver for the R9700s; libvulkan1: the
+# loader the bot opens at run time.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates \
+      mesa-vulkan-drivers libvulkan1 \
+ && rm -rf /var/lib/apt/lists/* \
+ && find / -xdev -type f -perm /6000 -exec chmod a-s {} +
+# ^ No setuid/setgid binaries: the unit can't use no-new-privileges (deploy.md 1.5).
+COPY --from=build /increbot /usr/local/bin/increbot
+# config.rsn and prompts/ (the persona files) are mounted here at run time.
+WORKDIR /app
+ENV HF_HOME=/hf
+ENTRYPOINT ["increbot", "serve", "--config", "/app/config.rsn"]

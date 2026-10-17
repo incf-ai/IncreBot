@@ -1,0 +1,19 @@
+[package]
+name = "chatsim-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Terminal-independent logic for the increbot chat-room simulator"
+
+[lints]
+workspace = true
+
+[dependencies]
+increbot = { path = "../.." }
+anyhow = "1"
+rand = "0.9"
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+hf-hub = { version = "=0.4.3", default-features = false, features = ["ureq", "rustls-tls"] }

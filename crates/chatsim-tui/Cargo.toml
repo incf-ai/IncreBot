@@ -1,0 +1,23 @@
+[package]
+name = "chatsim-tui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Terminal UI for the increbot chat-room simulator"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "chatsim"
+path = "src/main.rs"
+
+[dependencies]
+chatsim-core = { path = "../chatsim-core" }
+increbot = { path = "../.." }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+ratatui = "0.30"
+unicode-width = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

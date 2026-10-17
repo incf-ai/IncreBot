@@ -1,0 +1,54 @@
+rayon default threads (from env): 8
+
+=== THP MADV_HUGEPAGE : filled 13.8 GB in 2.5s, AnonHugePages for buffer ~13.8 GB ===
+read bandwidth (GB/s), and implied decode ceiling (tok/s = GB/s / 13.83):
+  threads= 1 unpinned    21.4 GB/s  -> 1.55 tok/s
+  threads= 2 unpinned    35.4 GB/s  -> 2.56 tok/s
+  threads= 4 unpinned    42.1 GB/s  -> 3.04 tok/s
+  threads= 6 unpinned    47.1 GB/s  -> 3.40 tok/s
+  threads= 8 unpinned    49.7 GB/s  -> 3.59 tok/s
+  threads=10 unpinned    49.1 GB/s  -> 3.55 tok/s
+  threads= 4 pinned      41.9 GB/s  -> 3.03 tok/s
+  threads= 6 pinned      48.2 GB/s  -> 3.48 tok/s
+  threads= 8 pinned      50.3 GB/s  -> 3.64 tok/s
+Q8_0 matvec over the whole 13.8 GB (one decode token's weight traffic):
+  threads= 4 unpinned portable   0.379 s/token   2.64 tok/s  ( 36.5 GB/s)
+  threads= 4 unpinned avx2       0.342 s/token   2.92 tok/s  ( 40.5 GB/s)
+  threads= 8 unpinned portable   0.287 s/token   3.48 tok/s  ( 48.1 GB/s)
+  threads= 8 unpinned avx2       0.280 s/token   3.57 tok/s  ( 49.4 GB/s)
+  threads=10 unpinned portable   0.289 s/token   3.46 tok/s  ( 47.9 GB/s)
+  threads=10 unpinned avx2       0.285 s/token   3.51 tok/s  ( 48.5 GB/s)
+  threads= 8 pinned   portable   0.287 s/token   3.48 tok/s  ( 48.2 GB/s)
+  threads= 8 pinned   avx2       0.281 s/token   3.56 tok/s  ( 49.2 GB/s)
+
+=== THP MADV_NOHUGEPAGE : filled 13.8 GB in 2.2s, AnonHugePages for buffer ~0.0 GB ===
+read bandwidth (GB/s), and implied decode ceiling (tok/s = GB/s / 13.83):
+  threads= 1 unpinned    21.4 GB/s  -> 1.54 tok/s
+  threads= 2 unpinned    35.1 GB/s  -> 2.54 tok/s
+  threads= 4 unpinned    42.7 GB/s  -> 3.08 tok/s
+  threads= 6 unpinned    47.1 GB/s  -> 3.40 tok/s
+  threads= 8 unpinned    49.7 GB/s  -> 3.59 tok/s
+  threads=10 unpinned    48.2 GB/s  -> 3.49 tok/s
+  threads= 4 pinned      42.2 GB/s  -> 3.05 tok/s
+  threads= 6 pinned      47.4 GB/s  -> 3.43 tok/s
+  threads= 8 pinned      49.8 GB/s  -> 3.60 tok/s
+Q8_0 matvec over the whole 13.8 GB (one decode token's weight traffic):
+  threads= 4 unpinned portable   0.403 s/token   2.48 tok/s  ( 34.3 GB/s)
+  threads= 4 unpinned avx2       0.345 s/token   2.89 tok/s  ( 40.0 GB/s)
+  threads= 8 unpinned portable   0.299 s/token   3.35 tok/s  ( 46.3 GB/s)
+  threads= 8 unpinned avx2       0.290 s/token   3.45 tok/s  ( 47.7 GB/s)
+  threads=10 unpinned portable   0.283 s/token   3.53 tok/s  ( 48.8 GB/s)
+  threads=10 unpinned avx2       0.279 s/token   3.59 tok/s  ( 49.6 GB/s)
+  threads= 8 pinned   portable   0.288 s/token   3.47 tok/s  ( 48.0 GB/s)
+  threads= 8 pinned   avx2       0.297 s/token   3.37 tok/s  ( 46.6 GB/s)
+
+=== f32 gemm (prefill linear layer; k = 5120, n = 13824) ===
+  threads= 8 unpinned m=  64    279.2 GFLOP/s  -> prefill ~ 10.7 tok/s (26 GFLOP/token, matmul only)
+  threads= 8 unpinned m= 256    495.6 GFLOP/s  -> prefill ~ 19.1 tok/s (26 GFLOP/token, matmul only)
+  threads= 8 unpinned m= 512    695.5 GFLOP/s  -> prefill ~ 26.8 tok/s (26 GFLOP/token, matmul only)
+  threads= 8 pinned   m=  64    581.7 GFLOP/s  -> prefill ~ 22.4 tok/s (26 GFLOP/token, matmul only)
+  threads= 8 pinned   m= 256   1056.4 GFLOP/s  -> prefill ~ 40.6 tok/s (26 GFLOP/token, matmul only)
+  threads= 8 pinned   m= 512   1097.8 GFLOP/s  -> prefill ~ 42.2 tok/s (26 GFLOP/token, matmul only)
+  threads=10 unpinned m=  64    312.2 GFLOP/s  -> prefill ~ 12.0 tok/s (26 GFLOP/token, matmul only)
+  threads=10 unpinned m= 256    524.5 GFLOP/s  -> prefill ~ 20.2 tok/s (26 GFLOP/token, matmul only)
+  threads=10 unpinned m= 512    579.6 GFLOP/s  -> prefill ~ 22.3 tok/s (26 GFLOP/token, matmul only)

@@ -1,0 +1,42 @@
+#version 460
+// RoPE on Q (in place) and K, and both K and V stored as f16 into the cache at
+// positions pos0.. . One invocation per pair: first Q's pairs, then K's (rotated
+// and stored), then V's (stored).
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    F32 q; F32 k; F32 v; F32 cos_; F32 sin_; F16 kc; F16 vc;
+    uint t; uint heads; uint kv_heads; uint head_dim; uint pos0;
+} p;
+
+void main() {
+    uint g = gl_GlobalInvocationID.x;
+    uint half_ = p.head_dim / 2;
+    uint qpairs = p.t * p.heads * half_, kpairs = p.t * p.kv_heads * half_;
+    uint kvw = p.kv_heads * p.head_dim;
+    if (g < qpairs + kpairs) {
+        bool is_q = g < qpairs;
+        uint pg = is_q ? g : g - qpairs;
+        uint per_row = (is_q ? p.heads : p.kv_heads) * half_;
+        uint row = pg / per_row, i = pg % half_;
+        float c = p.cos_.v[(p.pos0 + row) * half_ + i];
+        float s = p.sin_.v[(p.pos0 + row) * half_ + i];
+        F32 x = is_q ? p.q : p.k;
+        float a = x.v[2 * pg], b = x.v[2 * pg + 1];
+        float ra = a * c - b * s, rb = a * s + b * c;
+        if (is_q) {
+            x.v[2 * pg] = ra;
+            x.v[2 * pg + 1] = rb;
+        } else {
+            uint at = p.pos0 * kvw + 2 * pg;
+            p.kc.v[at] = float16_t(ra);
+            p.kc.v[at + 1] = float16_t(rb);
+        }
+    } else if (g < qpairs + kpairs + kpairs) {
+        uint pg = g - qpairs - kpairs;
+        uint at = p.pos0 * kvw + 2 * pg;
+        p.vc.v[at] = float16_t(p.v.v[2 * pg]);
+        p.vc.v[at + 1] = float16_t(p.v.v[2 * pg + 1]);
+    }
+}
