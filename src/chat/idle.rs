@@ -1,10 +1,11 @@
 //! What the bot was up to between its replies (design.md §7): after an hour
 //! without a reply in a channel, however busy it was, a scene is drawn
 //! (`discord::dispatch::watch_idle`, or the next reply itself), and the next
-//! reply there gets it as a line right after the history, "(earlier, floob
-//! was digging a new tunnel. he felt satisfied admiring a fine flat rock. he
-//! felt annoyed that it is not warm.)", from the persona's `idle_activities`
-//! and `idle_thoughts`.
+//! reply there gets it as a line right after the history, "(earlier, before
+//! this chat, floob was digging a new tunnel. he felt satisfied admiring a
+//! fine flat rock. he felt annoyed that it is not warm.)", from the persona's
+//! `idle_activities` and `idle_thoughts`. The latest messages are copied again
+//! after it (`chat::prompt::RECENT_MESSAGES`), so the reply answers them.
 //!
 //! Activities come from a shuffled deck per channel, without repeats until it
 //! runs out (then it reshuffles). Thoughts are put together fresh each time,
@@ -119,15 +120,18 @@ pub struct Scene {
 }
 
 impl Scene {
-    /// The prompt line: earlier, `bot` was (activity) …; each sentence of the
-    /// thought gets "he".
+    /// The prompt line: earlier, before this chat, `bot` was (activity) …;
+    /// each sentence of the thought gets "he". "before this chat" marks it as
+    /// background, not something to bring up over what people are saying.
     pub fn line(&self, bot: &str) -> String {
         let mut s = String::new();
         if !self.activity.is_empty() {
-            s.push_str(&format!("earlier, {bot} was {}.", self.activity.trim().trim_end_matches('.')));
+            s.push_str(&format!("earlier, before this chat, {bot} was {}.", self.activity.trim().trim_end_matches('.')));
         }
         for t in self.thought.split(". ").map(|t| t.trim().trim_end_matches('.')).filter(|t| !t.is_empty()) {
-            if !s.is_empty() {
+            if s.is_empty() {
+                s.push_str("before this chat, ");
+            } else {
                 s.push(' ');
             }
             s.push_str(&format!("he {t}."));
@@ -379,7 +383,7 @@ mod tests {
         };
         assert_eq!(
             s.line("floob"),
-            "(earlier, floob was digging a new tunnel. he felt satisfied admiring a fine flat rock. he felt annoyed that it is limestone.)"
+            "(earlier, before this chat, floob was digging a new tunnel. he felt satisfied admiring a fine flat rock. he felt annoyed that it is limestone.)"
         );
         assert_eq!(Idle::default().scene(1, 0, &[], &Thoughts::default()), None);
     }

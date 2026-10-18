@@ -1246,16 +1246,35 @@ Continue the conversation below as {{ bot_name }}.
 
 {% for m in history %}{{ m.author }}: {{ m.content }}
 {% endfor %}
-{% if repeat_persona %}{{ persona }}
+{% if scene %}{{ scene }}
+
+{% endif %}{% if repeat_persona %}{{ reminder }}
+
+{% endif %}{% if note %}{{ note }}
 
 {% endif %}### Instruction:
-Continue the conversation above as {{ bot_name }}.
+{% if recent %}The latest messages, which {{ bot_name }} is answering:
+{% for m in recent %}{{ m.author }}: {{ m.content }}
+{% endfor %}
+{% endif %}Continue the conversation as {{ bot_name }}.
 
 ### Response:
 {% if reply_to %}({{ bot_name }} is replying to {{ reply_to }})
 {% endif %}{{ bot_name }}:
 ```
 
+- **The latest messages, again.** `recent` is the last 4 turns of `history`
+  (`prompt::RECENT_MESSAGES`), whoever wrote them, each whole (a message can span
+  lines), copied into the closing instruction after the scene, reminder and notes.
+  Those sit between the history and the reply, and without the copy the reply
+  sometimes answered them instead of the people: at the start of a thread floob
+  talked about the seashell in his idle scene when asked about a magic potion.
+  Each message is already cut to `max_message_tokens`, so the copy needs no cap of
+  its own, and `window::select` counts the rendered prompt, so the copy is budgeted
+  with the history. It comes after the history, so the cached prefix holds, but the
+  CPU would prefill it for every reply (up to ~480 tokens, ~16 s), so like the
+  reminder it is left out there (`cpu_drop_persona_repeat`, below). DRY and the repeat penalty read the
+  history, not the template, so the copy changes neither.
 - **Two names.** `bot_name` ("IncreBot") is the bot's Discord-facing name; inside
   the prompt the bot is `persona_name` ("floob"; empty means `bot_name`). The template's
   `{{ bot_name }}`, the bot's own history turns and the `"\n<name>:"` stop string all use
@@ -1270,7 +1289,8 @@ Continue the conversation above as {{ bot_name }}.
   re-reads the repeat. It also counts twice in the header check below.
 - **No persona repeat on the CPU** (`cpu_drop_persona_repeat`, on in the shipped
   configs). When no GPU is ready as the prompt is built, `repeat_persona` is false
-  and only the instruction follows the history. The CPU prefills at ~25–30 tok/s,
+  and only the scene, any notes and the instruction follow the history, with no
+  `recent` copy. The CPU prefills at ~25–30 tok/s,
   so the ~200-token repeat cost ~7 s of a 11–17 s reply (10-message test,
   2026-10-12). A reply that starts on a GPU and moves to the CPU keeps the repeat.
 - **Example messages are not repeated.** A line that is exactly `---` in the system
@@ -1380,8 +1400,8 @@ Continue the conversation above as {{ bot_name }}.
   `max_prompt_tokens` before any history. At load and on every reload, the template is
   rendered with empty history and tokenized, and **a prompt whose header uses more
   than `max_header_tokens` is rejected** (0, the default, means half of
-  `max_prompt_tokens`). `max_header_tokens` plus `max_message_tokens` must fit in
-  `max_prompt_tokens`. A long persona counts twice, since the default template
+  `max_prompt_tokens`). `max_header_tokens` plus twice `max_message_tokens` must fit in
+  `max_prompt_tokens`, since the trigger message also appears in the `recent` copy. A long persona counts twice, since the default template
   repeats it after the history. `floob_bench` runs the same check, and
   `persona_report header <file>` shows a prompt's size against it. At startup
   that is a fatal error. On reload, the old prompt stays in effect and the error is
@@ -1483,11 +1503,13 @@ afterthought filled from their own lists ("felt proud when a beetle ate his
 lantern. felt smug that it could have been worse."). When the bot hasn't
 replied in a channel for an hour, however much others said there meanwhile,
 a timer (`dispatch::watch_idle`, every 30 s) draws an activity and a
-thought, and its next reply adds "(earlier, floob was digging a new tunnel.
-he felt satisfied admiring a fine flat rock. he felt annoyed that it is not
-warm.)" to the template's `scene` slot, after the history and the reminder,
-before any note, where the reply heeds it (at the top, above 20 messages, floob
-often forgot it even when asked what he had been up to). Reply times are
+thought, and its next reply adds "(earlier, before this chat, floob was
+digging a new tunnel. he felt satisfied admiring a fine flat rock. he felt
+annoyed that it is not warm.)" to the template's `scene` slot, right after the
+history, before the reminder and any note, where the reply heeds it (at the
+top, above 20 messages, floob often forgot it even when asked what he had been
+up to). "before this chat" and the `recent` copy after it keep it background:
+as the last thing before the reply, it once won over the question asked. Reply times are
 the trigger messages' snowflake times, kept in memory rather than read from
 the window, whose 20 messages can scroll the bot's last reply out within
 minutes in a busy channel; a retry doesn't move them back. The scene stays
@@ -1555,7 +1577,7 @@ Config {
         max_prompt_tokens:  2560, // persona + template (~1170 with c53), the rest history
         max_message_tokens: 120,  // per-message cap; must be < max_prompt_tokens / 2
         max_header_tokens:  0,    // persona + template; 0 = half of max_prompt_tokens (§7)
-        cpu_drop_persona_repeat: true,  // no reminder after the history on the CPU (§7)
+        cpu_drop_persona_repeat: true,  // no reminder or recent copy after the history on the CPU (§7)
         timeout_secs:   140,      // counted from job start; 2 × 140 ≤ 720; an /ask waits behind ≤ 4
     },
     discord: Discord {
@@ -1576,6 +1598,8 @@ Config {
 Config validation at startup:
 - `2 × timeout_secs ≤ 720`, and `queue_depth ≥ 1` (the interaction-token limit, §6)
 - `max_message_tokens < max_prompt_tokens / 2`
+- `max_header_tokens + 2 × max_message_tokens ≤ max_prompt_tokens` (the trigger
+  message fits twice, in the history and in `recent`, §7)
 - `max_prompt_tokens + max_new_tokens ≤ n_ctx`, each side (checked when the
   persona loads)
 - every channel in `dedicated_channels` or `shared_channels` belongs to a guild in

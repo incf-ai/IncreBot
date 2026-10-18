@@ -6,6 +6,11 @@ use serde::Serialize;
 
 use super::sanitize::{clean_name, lowercase_mentions, rename_aliases};
 
+/// How many of the latest turns the template gets again as `recent`, right
+/// before the reply, whoever wrote them. Each is already cut to
+/// `max_message_tokens`, so the copy needs no cap of its own.
+pub const RECENT_MESSAGES: usize = 4;
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct Turn {
     pub author: String,
@@ -92,9 +97,13 @@ impl PromptBuilder {
     /// Renders with `reply_to`, the author the bot is answering. It comes after
     /// the history in the template, so it never breaks the cached prefix; so does
     /// `repeat_persona` (false for a CPU reply, see `cpu_drop_persona_repeat`).
-    /// `scene` (what the bot was up to, `chat::idle`) goes after the history
-    /// and the reminder, where the reply heeds it, so it doesn't break the
-    /// cached prefix either.
+    /// `scene` (what the bot was up to before this chat, `chat::idle`) goes
+    /// right after the history, before the reminder and notes. The template's
+    /// `recent` is the last `RECENT_MESSAGES` turns, copied again after all of
+    /// those so the reply answers them, not the scene; it comes after the
+    /// history, so it doesn't break the cached prefix either. Like the
+    /// reminder, it is left out when `repeat_persona` is false: the CPU would
+    /// prefill it for every reply.
     pub fn render_reply(
         &self,
         history: &[Turn],
@@ -118,6 +127,7 @@ impl PromptBuilder {
                     examples => &self.examples,
                     bot_name => &self.bot_name,
                     history => history,
+                    recent => if repeat_persona { &history[history.len().saturating_sub(RECENT_MESSAGES)..] } else { &[] },
                     reply_to => reply_to,
                     repeat_persona => repeat_persona,
                     note => note,
@@ -351,7 +361,8 @@ mod tests {
         assert_eq!(
             out,
             "Be nice.\n\n### Instruction:\nContinue the conversation below as Increbot.\n\nAlice: hi\nIncrebot: hello\n\n\
-             Be nice.\n\n### Instruction:\nContinue the conversation above as Increbot.\n\n### Response:\nIncrebot:"
+             Be nice.\n\n### Instruction:\nThe latest messages, which Increbot is answering:\nAlice: hi\nIncrebot: hello\n\n\
+             Continue the conversation as Increbot.\n\n### Response:\nIncrebot:"
         );
         // Prefix stability: one more turn only appends before the repeated
         // system prompt and instruction.
@@ -376,12 +387,14 @@ mod tests {
         let without = p.render_reply(&turns, Some("Carol"), false, None, None).unwrap();
         assert!(
             without.ends_with(
-                "Carol: hi\n\n### Instruction:\nContinue the conversation above as floob.\n\n\
+                "Carol: hi\n\n### Instruction:\nContinue the conversation as floob.\n\n\
                  ### Response:\n(floob is replying to Carol)\nfloob:"
             ),
             "{without}"
         );
         assert_eq!(without.matches("Be nice.").count(), 1);
+        assert_eq!(with.matches("Carol: hi").count(), 2, "the GPU prompt has the copy");
+        assert_eq!(without.matches("Carol: hi").count(), 1, "the CPU prompt doesn't");
         // The cached prefix (through the history) is the same either way.
         let cut = without.rfind("\n### Instruction:").unwrap();
         assert!(with.starts_with(&without[..cut]));
@@ -399,7 +412,8 @@ mod tests {
         assert_eq!(
             out,
             "Be nice.\nA: hi\nB: hello\n\n### Instruction:\nContinue the conversation below as B.\n\n\
-             Carol: hey\n\nBe nice.\n\n### Instruction:\nContinue the conversation above as B.\n\n### Response:\nB:"
+             Carol: hey\n\nBe nice.\n\n### Instruction:\nThe latest messages, which B is answering:\nCarol: hey\n\n\
+             Continue the conversation as B.\n\n### Response:\nB:"
         );
     }
 
@@ -413,7 +427,8 @@ mod tests {
         let with = p.render_reply(&turns, Some("Carol"), true, None, None).unwrap();
         assert!(
             with.ends_with(
-                "Carol: hi\n\nBe nice.\n\n### Instruction:\nContinue the conversation above as floob.\n\n\
+                "Carol: hi\n\nBe nice.\n\n### Instruction:\nThe latest messages, which floob is answering:\nCarol: hi\n\n\
+                 Continue the conversation as floob.\n\n\
                  ### Response:\n(floob is replying to Carol)\nfloob:"
             ),
             "{with}"
@@ -426,6 +441,36 @@ mod tests {
             without[..cut],
             "the cached prefix is unchanged"
         );
+    }
+
+    #[test]
+    fn the_latest_messages_are_copied_after_the_scene_and_notes() {
+        let p = PromptBuilder::new(DEFAULT_TEMPLATE, "floob", "persona", "", "reminder").unwrap();
+        let turns: Vec<Turn> = (1..=6)
+            .map(|i| Turn {
+                author: if i % 2 == 0 { "floob" } else { "Carol" }.into(),
+                content: format!("m{i}\nline two"),
+            })
+            .collect();
+        let scene = "(earlier, before this chat, floob was holding a seashell.)";
+        let text = p.render_reply(&turns, Some("Carol"), true, Some("(a note)"), Some(scene)).unwrap();
+        let copy = &text[text.rfind("### Instruction:").unwrap()..];
+        assert!(
+            copy.starts_with(
+                "### Instruction:\nThe latest messages, which floob is answering:\n\
+                 Carol: m3\nline two\nfloob: m4\nline two\nCarol: m5\nline two\nfloob: m6\nline two\n\n\
+                 Continue the conversation as floob.\n\n### Response:\n(floob is replying to Carol)\nfloob:"
+            ),
+            "{text}"
+        );
+        // Order after the history: scene, reminder, note, then the copy.
+        let at = |s: &str| text.find(s).unwrap();
+        assert!(at("Carol: m5\nline two\nfloob: m6") < at(scene));
+        assert!(at(scene) < at("reminder") && at("reminder") < at("(a note)") && at("(a note)") < at("### Instruction:\nThe latest"));
+        // The copy comes after the history, so one more turn keeps the cached prefix.
+        let shorter = p.render_reply(&turns[..5], Some("Carol"), true, None, None).unwrap();
+        let cut = shorter.find("Carol: m5\nline two\n").unwrap() + "Carol: m5\nline two\n".len();
+        assert!(text.starts_with(&shorter[..cut]));
     }
 
     #[test]

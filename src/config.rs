@@ -25,14 +25,17 @@ Continue the conversation below as {{ bot_name }}.
 
 {% for m in history %}{{ m.author }}: {{ m.content }}
 {% endfor %}
-{% if repeat_persona %}{{ reminder }}
+{% if scene %}{{ scene }}
 
-{% endif %}{% if scene %}{{ scene }}
+{% endif %}{% if repeat_persona %}{{ reminder }}
 
 {% endif %}{% if note %}{{ note }}
 
 {% endif %}### Instruction:
-Continue the conversation above as {{ bot_name }}.
+{% if recent %}The latest messages, which {{ bot_name }} is answering:
+{% for m in recent %}{{ m.author }}: {{ m.content }}
+{% endfor %}
+{% endif %}Continue the conversation as {{ bot_name }}.
 
 ### Response:
 {% if reply_to %}({{ bot_name }} is replying to {{ reply_to }})
@@ -143,9 +146,11 @@ pub struct GenerationConfig {
     /// The most tokens the system prompt and fixed template text may take, so
     /// enough is left for the history; 0 = half of `max_prompt_tokens`.
     pub max_header_tokens: usize,
-    /// Leave out the persona the default template repeats after the history when
-    /// no GPU is ready (design.md §7): it changes every turn, so the CPU
-    /// prefills it for every reply (~200 tokens, ~7 s with the 13B).
+    /// Leave out the persona the default template repeats after the history,
+    /// and its copy of the latest messages (`recent`), when no GPU is ready
+    /// (design.md §7): both come after the history, so the CPU prefills them
+    /// for every reply (~200 tokens, ~7 s with the 13B, for the reminder; up
+    /// to ~480 for the copy).
     pub cpu_drop_persona_repeat: bool,
     pub timeout_secs: u64,
 }
@@ -629,8 +634,8 @@ impl Config {
             g.max_prompt_tokens / 2
         );
         ensure!(
-            g.header_limit() + g.max_message_tokens <= g.max_prompt_tokens,
-            "max_header_tokens ({}) + max_message_tokens ({}) must be <= max_prompt_tokens ({}), so the trigger message fits",
+            g.header_limit() + 2 * g.max_message_tokens <= g.max_prompt_tokens,
+            "max_header_tokens ({}) + 2 * max_message_tokens ({}) must be <= max_prompt_tokens ({}), so the trigger message fits (it is also copied after the notes)",
             g.header_limit(),
             g.max_message_tokens,
             g.max_prompt_tokens

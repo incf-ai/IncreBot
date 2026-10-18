@@ -93,8 +93,8 @@ pub struct Persona {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bans: Vec<Ban>,
     /// What the bot was up to between replies (`chat::idle`): after an hour
-    /// without a reply in a channel, the next reply gets "(earlier, floob was
-    /// {activity}. he felt {emotion} {situation}.)" after the history for 15
+    /// without a reply in a channel, the next reply gets "(earlier, before this chat,
+    /// floob was {activity}. he felt {emotion} {situation}.)" after the history for 15
     /// minutes. Activities are what follows "was" ("digging a
     /// new tunnel"), dealt without repeats per channel; thoughts are put
     /// together from `idle_thoughts`' parts each time (Dwarf Fortress-style).

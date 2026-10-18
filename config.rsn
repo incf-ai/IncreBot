@@ -34,8 +34,8 @@ Config {
         max_prompt_tokens:  2560, // persona + template (~1170 with c53), the rest history
         max_message_tokens: 120,  // per-message cap before "…"; must be < max_prompt_tokens / 2
         max_header_tokens:  0,    // persona + template; 0 = half of max_prompt_tokens (1280)
-        cpu_drop_persona_repeat: true,  // no persona after the history while no GPU is ready:
-                                  // saves ~7 s of prefill per CPU reply (design.md §7)
+        cpu_drop_persona_repeat: true,  // no persona or recent-messages copy after the history while
+                                  // no GPU is ready: saves ~7 s or more of prefill per CPU reply (design.md §7)
         timeout_secs:   140,      // per reply, from job start; 2 × timeout_secs <= 720 (an /ask waits
                                   // behind at most 720 / timeout_secs − 1 jobs, else "busy")
     },
