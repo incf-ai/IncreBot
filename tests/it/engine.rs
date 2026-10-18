@@ -97,6 +97,7 @@ async fn run_sampled(
                 wrap_up_after_gpu: 0,
 stops: vec![],
         max_lines: None,
+        labels: false,
         timeout: Duration::from_secs(60),
         cancel: cancel.clone(),
         events: tx,

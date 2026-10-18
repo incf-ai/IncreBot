@@ -188,6 +188,7 @@ impl Backend for EngineBackend {
             wrap_up_after_gpu: p.limits(None).wrap_up_after_gpu,
             stops: req.stops,
             max_lines: p.limits(None).max_lines,
+            labels: true,
             timeout: self.timeout,
             cancel: req.cancel,
             events: tx,

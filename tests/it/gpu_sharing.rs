@@ -275,6 +275,7 @@ fn worker_replies_on_the_gpu() {
                 wrap_up_after_gpu: 0,
 stops: vec![],
         max_lines: None,
+        labels: false,
             timeout: Duration::from_secs(60),
             cancel: Arc::default(),
             events: tx,

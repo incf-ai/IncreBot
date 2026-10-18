@@ -46,6 +46,8 @@ pub struct Job {
     pub stops: Vec<String>,
     /// See [`GenerateRequest::max_lines`].
     pub max_lines: Option<std::num::NonZeroUsize>,
+    /// See [`GenerateRequest::labels`].
+    pub labels: bool,
     /// For the whole job, all candidates together.
     pub timeout: Duration,
     pub cancel: Arc<AtomicBool>,
@@ -384,6 +386,7 @@ fn run_job(
             wrap_up_after_gpu: job.wrap_up_after_gpu,
             stops: job.stops.clone(),
             max_lines: job.max_lines,
+            labels: job.labels,
             timeout: Some(left),
             history: &job.history,
             cancel: Some(&job.cancel),

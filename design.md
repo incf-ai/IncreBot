@@ -1439,6 +1439,13 @@ Continue the conversation above as {{ bot_name }}.
   the idle scene. After its reply the model sometimes copies a note word for word
   on a new line, or starts an aside to someone else (`(to FM)`), which then sits
   in the history as the bot's own line and invites more.
+- Replies also stop at the line break before a later line that opens with any
+  speaker label (`name: `, up to 3 words and 32 characters, then a colon and a
+  space or the line's end; `StreamDecoder::labels`). The model sometimes makes
+  up a user who isn't in the window (`funkengine_llm_dummy:` after
+  `funkengine_llm_prompt_mechanic` had posted) and writes their line, which no
+  `"\n<name>:"` stop covers. The last line is held back while it could still
+  become one. Actions, sentences (`oh no! wait:`), times and links don't count.
 - Discord mentions are rendered to display names on the way in, and `@everyone`/`@here`
   are neutralised on the way out (`AllowedMentions::none()` plus replying to the user).
 - **Turn spoofing.** User text must not be able to forge the template's structure.

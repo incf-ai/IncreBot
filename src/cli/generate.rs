@@ -81,6 +81,7 @@ pub fn generate(args: GenerateArgs) -> Result<()> {
         wrap_up_after_gpu: 0,
         stops: args.stops,
         max_lines: None,
+        labels: false,
         timeout: None,
         history: &prompt_ids,
         cancel: None,

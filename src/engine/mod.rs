@@ -87,6 +87,8 @@ pub struct GenerateRequest<'a> {
     pub stops: Vec<String>,
     /// Stop at the line break ending this many non-blank lines (`StreamDecoder::max_lines`).
     pub max_lines: Option<std::num::NonZeroUsize>,
+    /// Stop at a later line opening with any speaker label (`StreamDecoder::labels`).
+    pub labels: bool,
     /// Counted from the start of this call, i.e. from job start (design.md §5).
     pub timeout: Option<Duration>,
     /// The chat history without the template, tokenized: what DRY (and the
@@ -136,7 +138,7 @@ pub fn generate(
     let mut context = req.history.to_vec();
     let first_chars = req.bans.and_then(|b| b.first_chars.as_deref());
     let bans = req.bans.filter(|b| !b.is_empty());
-    let mut dec = StreamDecoder::new(req.stops).max_lines(req.max_lines).hold_tokens(if bans.is_some() { bans::HOLDBACK } else { 0 });
+    let mut dec = StreamDecoder::new(req.stops).max_lines(req.max_lines).labels(req.labels).hold_tokens(if bans.is_some() { bans::HOLDBACK } else { 0 });
     // For rollback (`bans`): the raw logits each position was sampled from,
     // the tokens banned at each position, and where the cache's reply starts.
     let base = cache.len();

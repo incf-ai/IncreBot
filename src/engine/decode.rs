@@ -15,6 +15,12 @@
 //! With a line limit (`max_lines`), the line break that ends the last allowed
 //! line is a stop too. Only lines with something on them count, so a blank
 //! line between two doesn't use one up.
+//!
+//! With `labels`, a line after the first that opens with a speaker label
+//! (`name: `, [`is_label`]) stops the reply at the line break before it: the
+//! model writing a transcript for someone not in the chat, whom no
+//! `"\n<name>:"` stop string covers. A last line that could still become one
+//! is held back.
 
 use std::num::NonZeroUsize;
 
@@ -37,6 +43,7 @@ pub struct StreamDecoder {
     /// bans may still roll them back, `engine::bans`).
     hold_tokens: usize,
     max_lines: Option<NonZeroUsize>,
+    labels: bool,
 }
 
 impl StreamDecoder {
@@ -51,12 +58,19 @@ impl StreamDecoder {
             emitted: 0,
             hold_tokens: 0,
             max_lines: None,
+            labels: false,
         }
     }
 
     /// Stop at the line break ending the `n`-th non-blank line.
     pub fn max_lines(mut self, n: Option<NonZeroUsize>) -> Self {
         self.max_lines = n;
+        self
+    }
+
+    /// Stop at the line break before a line opening with a speaker label.
+    pub fn labels(mut self, on: bool) -> Self {
+        self.labels = on;
         self
     }
 
@@ -97,8 +111,14 @@ impl StreamDecoder {
     /// cancel). Never call after `Step::Stop`.
     pub fn finish<E>(&mut self, decode: impl Fn(&[u32]) -> Result<String, E>) -> Result<String, E> {
         let text = decode(&self.ids)?;
-        let rest = text.get(self.emitted..).unwrap_or_default().to_string();
-        self.emitted = text.len();
+        let lead = text.len() - text.trim_start().len();
+        // The reply may end right on a label's colon.
+        let end = match self.labels.then(|| label_line(&text, lead, true)) {
+            Some(Label { at: Some(at), .. }) => at.max(self.emitted),
+            _ => text.len(),
+        };
+        let rest = text.get(self.emitted..end).unwrap_or_default().to_string();
+        self.emitted = end;
         Ok(rest)
     }
 
@@ -124,6 +144,7 @@ impl StreamDecoder {
         }
         let folded = text.to_ascii_lowercase();
         let lead = text.len() - text.trim_start().len();
+        let label = if self.labels { label_line(text, lead, false) } else { Label::default() };
         let first_stop = self
             .stops
             .iter()
@@ -135,6 +156,7 @@ impl StreamDecoder {
             })
             .map(|rel| search_from + rel)
             .chain(self.max_lines.and_then(|n| line_end(text, lead, n.get())))
+            .chain(label.at)
             .min();
         if let Some(at) = first_stop {
             let end = at.max(self.emitted);
@@ -157,6 +179,9 @@ impl StreamDecoder {
             .max()
             .unwrap_or(0);
         safe -= hold;
+        if let Some(h) = label.hold {
+            safe = safe.min(h);
+        }
         if let Some(h) = held {
             safe = safe.min(h);
             while !text.is_char_boundary(safe) {
@@ -191,6 +216,67 @@ fn line_end(text: &str, lead: usize, n: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Where speaker labels are in a reply (`StreamDecoder::labels`).
+#[derive(Default)]
+struct Label {
+    /// The line break before the first line that opens with one.
+    at: Option<usize>,
+    /// The line break before the last line, which could still become one.
+    hold: Option<usize>,
+}
+
+/// The speaker labels in `text` after the line holding its first visible
+/// character (`lead` is its leading whitespace). `done`: the text is final, so
+/// a colon at its very end counts.
+fn label_line(text: &str, lead: usize, done: bool) -> Label {
+    let first = text[lead..].find('\n').map_or(text.len(), |i| lead + i);
+    let mut breaks = text[first..].match_indices('\n').map(|(i, _)| first + i).peekable();
+    while let Some(nl) = breaks.next() {
+        let line = &text[nl + 1..breaks.peek().copied().unwrap_or(text.len())];
+        let last = breaks.peek().is_none();
+        match is_label(line, done || !last) {
+            Some(true) => return Label { at: Some(nl), hold: None },
+            Some(false) => {}
+            None => return Label { at: None, hold: Some(nl) },
+        }
+    }
+    Label::default()
+}
+
+/// Longest speaker name taken as a label, in characters (Discord's limit).
+const LABEL_CHARS: usize = 32;
+/// Most words in a speaker name taken as a label.
+const LABEL_WORDS: usize = 3;
+
+/// Whether `line` opens with a speaker label: up to [`LABEL_WORDS`] words and
+/// [`LABEL_CHARS`] characters of a name, then a colon and a space or the
+/// line's end ("funkengine_llm_dummy: @floob…"). Not an `*action*`, a
+/// sentence ("oh no! wait:"), a time ("12:30") or a link ("https://").
+/// `None` while it could still become one: the line isn't `complete`.
+fn is_label(line: &str, complete: bool) -> Option<bool> {
+    let name = |s: &str| {
+        let first = s.chars().next();
+        s.chars().count() <= LABEL_CHARS
+            && first.is_none_or(|c| !c.is_whitespace())
+            && s.split(' ').count() <= LABEL_WORDS
+            && !s.contains("  ")
+            && !s.contains(|c: char| (c.is_whitespace() && c != ' ') || "*()[]{}<>!?,;\"~".contains(c))
+    };
+    match line.split_once(':') {
+        Some((n, after)) => Some(
+            !n.is_empty()
+                && name(n)
+                && match after.chars().next() {
+                    Some(c) => c.is_whitespace(),
+                    None if complete => true,
+                    None => return None,
+                },
+        ),
+        None if !complete && name(line) => None,
+        None => Some(false),
+    }
 }
 
 /// Length of the longest proper prefix of `stop` that `text` ends with, on char
@@ -379,4 +465,58 @@ mod tests {
         assert_eq!(out, "a b e");
     }
 
+    fn run_labels(pieces: &[&str]) -> (Vec<Step>, String) {
+        let mut d = StreamDecoder::new(vec![]).labels(true);
+        let decode = |ids: &[u32]| Ok::<_, Infallible>(ids.iter().map(|&i| pieces[i as usize]).collect::<String>());
+        let mut steps = Vec::new();
+        for i in 0..pieces.len() as u32 {
+            let s = d.push(i, decode).unwrap();
+            let stop = matches!(s, Step::Stop(_));
+            steps.push(s);
+            if stop {
+                return (steps, String::new());
+            }
+        }
+        let rest = d.finish(decode).unwrap();
+        (steps, rest)
+    }
+
+    #[test]
+    fn a_label_for_someone_not_in_the_chat_stops_at_its_line_break() {
+        // The leak: a made-up name no "\n<name>:" stop covers.
+        let (steps, _) = run_labels(&["its so shiny...", "\n", "funk", "engine_llm", "_dummy", ":", " @floob why"]);
+        assert_eq!(released(&steps), "its so shiny...");
+        assert!(matches!(steps.last(), Some(Step::Stop(_))));
+        // The line is held back while it could still be one.
+        assert_eq!(steps[1], Step::Text(String::new()));
+        assert_eq!(steps[4], Step::Text(String::new()));
+        // Names with spaces and other scripts; a reply ending on the colon.
+        let (steps, rest) = run_labels(&["hi!!\nbig bob:"]);
+        assert_eq!(released(&steps) + &rest, "hi!!");
+        let (steps, _) = run_labels(&["hi\nquͫaͦcͦk: [sticker]"]);
+        assert_eq!(released(&steps), "hi");
+        // Only later lines: the first is the bans' business (`with_prefixes`).
+        let (steps, rest) = run_labels(&["\n bob: hi"]);
+        assert_eq!(released(&steps) + &rest, "\n bob: hi");
+    }
+
+    #[test]
+    fn lines_that_only_look_like_labels_are_kept() {
+        for text in [
+            "ok\n*grabs it* see: shiny",
+            "ok\noh no! wait: what",
+            "ok\nmeet at 12:30 ok",
+            "ok\nhttps://example.com",
+            "ok\n:3 hehe",
+            "ok\nthis is way too many words: really",
+            "ok\nhehe:3",
+            "ok\n\nmore",
+        ] {
+            let (steps, rest) = run_labels(&[text]);
+            assert_eq!(released(&steps) + &rest, text, "{text:?}");
+        }
+        // Released once it can't be one any more.
+        let (steps, _) = run_labels(&["ok\nso", " then", " i went", " home"]);
+        assert_eq!(released(&steps), "ok\nso then i went home");
+    }
 }

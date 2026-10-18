@@ -444,6 +444,7 @@ fn main() -> Result<()> {
                 wrap_up_after_gpu: p.limits(command_name).wrap_up_after_gpu,
                 stops,
                 max_lines: p.limits(command_name).max_lines,
+                labels: true,
                 timeout: Duration::from_secs(g.timeout_secs),
                 cancel: Arc::default(),
                 events: tx,
