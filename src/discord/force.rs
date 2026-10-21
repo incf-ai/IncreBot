@@ -1,5 +1,5 @@
 //! "Admin actions" (design.md §6): a right-click (Apps) entry on a message,
-//! opening an ephemeral panel. On any of the channel's last `retry::RECENT`
+//! opening an ephemeral panel. On any of the channel's last `retry.admin_recent`
 //! outputs: retry, batch-retry, edit or delete it. On it or any of the
 //! channel's last traced messages (`chat::trace`): Trace, the log of what
 //! happened to the message (the one a reply answers), as a text file; and
@@ -29,10 +29,11 @@ const FORM_LIMIT: usize = 4000;
 const GONE: u64 = 1;
 
 /// Why an admin action can't go ahead.
-pub(super) fn refusal(r: Refusal) -> &'static str {
+/// `recent`: how many outputs per channel it remembers (`retry.admin_recent`).
+pub(super) fn refusal(r: Refusal, recent: usize) -> String {
     match r {
-        Refusal::Retrying => "A retry, undo, edit or delete is already running here; try again once it's done.",
-        _ => "That isn't a reply the bot still remembers: only the last 20 in each channel since the last restart.",
+        Refusal::Retrying => "A retry, undo, edit or delete is already running here; try again once it's done.".into(),
+        _ => format!("That isn't a reply the bot still remembers: only the last {recent} in each channel since the last restart."),
     }
 }
 
@@ -57,8 +58,9 @@ impl Drop for Held {
 
 /// Takes the channel's lock for an admin action on `out`, returning the
 /// output as it is now; or the reason it can't.
-fn hold(data: &Data, channel: u64, out: &Output<Replay>) -> Result<(Held, Output<Replay>), &'static str> {
-    let now = data.retry().begin_force(channel, out.finished_id).map_err(refusal)?;
+fn hold(data: &Data, channel: u64, out: &Output<Replay>) -> Result<(Held, Output<Replay>), String> {
+    let recent = data.cfg.discord.retry.admin_recent;
+    let now = data.retry().begin_force(channel, out.finished_id).map_err(|r| refusal(r, recent))?;
     Ok((Held(data.clone(), channel), now))
 }
 
@@ -156,7 +158,7 @@ pub(super) async fn admin_actions(ctx: Context<'_>, msg: serenity::Message) -> R
                 let (held, now) = match hold(&data, channel, out) {
                     Ok(h) => h,
                     Err(why) => {
-                        handle.edit(ctx, say(why)).await?;
+                        handle.edit(ctx, say(&why)).await?;
                         break d.notice_ttl_ms;
                     }
                 };
@@ -209,13 +211,13 @@ pub(super) async fn admin_actions(ctx: Context<'_>, msg: serenity::Message) -> R
                 let (held, now) = match hold(&data, channel, out) {
                     Ok(h) => h,
                     Err(why) => {
-                        handle.edit(ctx, say(why)).await?;
+                        handle.edit(ctx, say(&why)).await?;
                         break d.notice_ttl_ms;
                     }
                 };
                 let mut source = now.replay.source.clone();
                 if !without_optouts(&data, &mut source) {
-                    handle.edit(ctx, say(refusal(Refusal::Nothing))).await?;
+                    handle.edit(ctx, say(&refusal(Refusal::Nothing, data.cfg.discord.retry.admin_recent))).await?;
                     break d.notice_ttl_ms;
                 }
                 let job = requeue(&data, http.clone(), ctx.channel_id(), ctx.id(), &now, source, Some(now.finished_id));
@@ -237,7 +239,7 @@ pub(super) async fn admin_actions(ctx: Context<'_>, msg: serenity::Message) -> R
                 let (held, now) = match hold(&data, channel, out) {
                     Ok(h) => h,
                     Err(why) => {
-                        handle.edit(ctx, say(why)).await?;
+                        handle.edit(ctx, say(&why)).await?;
                         break d.notice_ttl_ms;
                     }
                 };
@@ -274,10 +276,9 @@ pub(super) async fn admin_actions(ctx: Context<'_>, msg: serenity::Message) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::retry::RECENT;
 
     #[test]
     fn the_refusal_names_the_limit() {
-        assert!(refusal(Refusal::Nothing).contains(&RECENT.to_string()));
+        assert!(refusal(Refusal::Nothing, 17).contains("last 17 "));
     }
 }

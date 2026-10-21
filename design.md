@@ -835,7 +835,12 @@ dequeued, so it never runs.
   while it generates keeps it out. `/retry`, "Admin actions" rewrites and
   `/undo-retry` replace the bot's turn and keep the requester's, while it
   is still in the window (once it has left, a retry edits the messages but
-  puts nothing back in the history). A persona reload applies to answers
+  puts nothing back in the history). A retry's part past the old messages
+  posts as a reply to the card (no ping), and the seed joins a bot message
+  replying to its own card to that exchange, like a follow-up. One gap
+  stands: with the card's first message deleted by hand, Discord no longer
+  says what such a part replied to (and a retry then posts its parts
+  without one), so a cold start reads it as a plain bot turn. A persona reload applies to answers
   from then on; those already in a window stay. If the interaction token
   expired and the answer fell back to a plain message, it enters history as
   the plain bot turn a cold start reads it back as (mention and card
@@ -1082,15 +1087,25 @@ dequeued, so it never runs.
   steer it away from the old wording. A channel reply's prefix is still in the
   KV cache, so it costs almost no prefill. Refused, with an ephemeral reason, unless:
   - the caller asked for the original (admins included: no exception);
-  - since the output finished generating, nothing happened in the channel except
-    `/retry`, `/retry-batch`, `/undo-retry`, `/delete-reply`, "Admin actions" and "Reply actions": no message from anyone but the bot (`//` and opted-out users'
-    messages count; only their IDs are kept), and no other command (poise's
-    `pre_command`). Only what is timestamped after the finish counts: messages
-    sent while it streamed don't. The finish is taken as a snowflake from the
-    bot's clock and compared with Discord's IDs, so clock skew of a second or
-    so shifts the line by that much;
-  - that still holds **1 s** after the `/retry` (checked again then);
-  - the output finished at most **300 s** ago (a finished retry restarts the clock);
+  - it is still the channel's newest output, and no message of floob's newer
+    than its first finish is still there but its own (a retry's extra
+    rollover part is its own): a `/shake` message, a card posted alone when
+    the queue was full or left by a dropped reply block it; a reply that
+    posted nothing, or a message since deleted, doesn't. floob's messages are
+    taken from the gateway (it delivers the bot's own), and noted at once
+    where it posts outside an output; leftovers a retry, undo or admin
+    rewrite deletes stop counting at once;
+  - at most **5** messages came after it that floob can see: anyone's but
+    floob's (other bots' too), `//` and opted-out users' not counted. One deleted, edited into
+    `//`, or from a user who opts out since stops counting (edited back out of
+    `//`, it counts again); only their IDs and authors are kept. Commands
+    don't count. Only what is
+    timestamped after the output first finished counts: messages sent while it
+    streamed don't, messages sent while a retry of it streamed do. The finish is
+    taken as a snowflake from the bot's clock and compared with Discord's IDs,
+    so clock skew of a second or so shifts the line by that much;
+  - the output first finished at most **300 s** ago (a retry or undo keeps the
+    original's clock);
   - no other retry is running or waiting in that channel;
   - no other reply is being written or waiting in that channel;
   - the caller is within the generation limits (below).
@@ -1098,6 +1113,9 @@ dequeued, so it never runs.
   Stopped, timed-out and failed outputs can be retried; dropped ones can't.
   Users who opted out since are removed from the frozen history first.
   `/super-admin reset` forgets the channel's last output and its undo stack.
+  The numbers here (5 messages, 300 s), and below (the undo stack's 10, the
+  admin menu's 20, steering from 3 outputs, `/delete-reply`'s 1 s second look)
+  are the defaults of `discord.retry` in config.
 - **`/retry-batch`** (same audience and rules as `/retry`; `discord/batch.rs`)
   generates **5** versions instead of one, GPU only: refused unless a GPU is
   ready when it is sent (one lost meanwhile only makes the rest slower). They
@@ -1106,8 +1124,8 @@ dequeued, so it never runs.
   panel shows progress and Cancel (which stops the running one), then numbered
   previews, a dropdown (failed ones left out) and Cancel; picking a version
   applies it at once. The rules are checked when it is sent and again at
-  the pick, bar the 300 s limit there: nothing happened since the output, nothing
-  being written, the output still the channel's last, and the same 1 s later.
+  the pick, bar the 300 s limit there: at most 5 messages since the output,
+  nothing being written, and the output still the channel's last.
   The pick writes its text over the old message(s) as a `/retry` would, so
   `/undo-retry` puts the old one back. The retry lock is held from the command
   to the pick, Cancel or the panel's **10 min** timeout. Everyone is
@@ -1196,9 +1214,9 @@ dequeued, so it never runs.
   pops the newest back, so repeated undos walk back to the original, and a
   `/retry` after an undo pushes again. The stack holds at most **10**; past that
   the oldest retry goes, the original stays. A new reply in the channel clears it.
-  The same rules as `/retry` apply except the 1 s re-check and the generation limits: the
-  caller asked for the original, nothing happened since the current output
-  finished, within 300 s of it (an undo restarts the clock), nothing being
+  The same rules as `/retry` apply except the generation limits: the
+  caller asked for the original, it is still the newest output, at most 5
+  messages since, within 300 s of the original's finish, nothing being
   written, and no retry or undo running. The old text goes into the current
   messages in order (the card stays on the first), extra messages are posted or
   deleted, and a channel reply's turn is put back in the history window. A later
@@ -1206,11 +1224,14 @@ dequeued, so it never runs.
   `discord.retrying_ttl_ms`.
 - **`/delete-reply`** (same audience as `/retry`, ephemeral) deletes the channel's
   last output: every message of it, the novelty card too, and a channel reply's
-  turn leaves the history window at once. Same rules as `/retry` without the
-  time limit and the generation limits: the caller asked for it (admins included),
-  nothing happened since it finished (`/retry`, `/undo-retry` and
-  `/delete-reply` don't count, so a retried reply can be deleted), still true
-  1 s later, nothing being written, and no retry or undo running. Not stackable:
+  turn leaves the history window at once. Stricter than `/retry`, with no
+  time limit or generation limits: the caller asked for it (admins included),
+  nothing at all happened since it first finished: no message from anyone but
+  floob (`//` and opted-out users' count), no message of floob's but its own
+  (as for `/retry`), and no command but `/retry`,
+  `/retry-batch`, `/undo-retry`, `/delete-reply`, "Admin actions" and "Reply
+  actions" (poise's `pre_command`), so a retried reply can be deleted; still
+  true **1 s** later, nothing being written, and no retry or undo running. Not stackable:
   afterwards the channel has no last output and no undo stack, so nothing
   before it can be deleted, retried or undone. "Deleted." deletes itself after
   `discord.retrying_ttl_ms`.
@@ -1314,7 +1335,7 @@ Continue the conversation below as {{ bot_name }}.
   prefix, and tells the model whom it is answering when several people are talking.
 
 - **Persona files.** Everything that shapes how the bot replies is in one
-  file, `discord.persona_file` (`prompts/c53.rsn`; `INCREBOT_PERSONA_FILE`
+  file, `discord.persona_file` (`prompts/c55.rsn`; `INCREBOT_PERSONA_FILE`
   overrides it; persona-plan.md). build.rs reads the shipped config's value
   as the code default and embeds that file as the built-in persona. It holds:
   - the prompt sections `persona`, `examples` and `reminder`, as raw strings
@@ -1574,7 +1595,7 @@ Config {
         queue_depth:    2,        // waiting replies per channel; newer messages there are ignored when full (§6)
     },
     generation: Generation {
-        max_prompt_tokens:  2560, // persona + template (~1170 with c53), the rest history
+        max_prompt_tokens:  2560, // persona + template (~1265 with c55), the rest history
         max_message_tokens: 120,  // per-message cap; must be < max_prompt_tokens / 2
         max_header_tokens:  0,    // persona + template; 0 = half of max_prompt_tokens (§7)
         cpu_drop_persona_repeat: true,  // no reminder or recent copy after the history on the CPU (§7)
@@ -1582,7 +1603,7 @@ Config {
     },
     discord: Discord {
         bot_name:           "IncreBot",
-        persona_file:       "prompts/c53.rsn",  // prompt, notes, biases, sampler, reply length (§7)
+        persona_file:       "prompts/c55.rsn",  // prompt, notes, biases, sampler, reply length (§7)
         history_messages:   20,   // last 10–20 messages; the anchor drops the older half (§6)
         stream_edits:       true,
         guilds:             [],   // allowlist, [Guild { id, name }]; empty = none

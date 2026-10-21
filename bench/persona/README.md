@@ -20,8 +20,8 @@ kept for history, never overwritten:
 | `run.sh` | one benchmark run from inside the devcontainer |
 | `pairwise.rs`, `hotdog.rs`, `quality.rs`, `group.rs` | modules of `persona_report` (`quality.rs` and `group.rs`: the quality and group sets' reports, §2): `persona_report pairwise …` (blind pairwise ratings between two runs on the same scenarios, the hotdog rater, §2) and `persona_report hotdog …` (its guardrails: anchors, copies, wrong owner) |
 | `queue.sh` | several runs from one frozen snapshot of the config, persona files, scenarios and binary |
-| `/prompts/cN.rsn` (repo root) | the current persona file (c53): prompt, notes, word biases, stop strings and sampler in one file (persona-plan.md); `config.rsn` names it |
-| `/prompts/legacy-rsn/cN.rsn` | retired persona files, c17–c52 (git-ignored) |
+| `/prompts/cN.rsn` (repo root) | the current persona file (c55): prompt, notes, word biases, stop strings and sampler in one file (persona-plan.md); `config.rsn` names it |
+| `/prompts/legacy-rsn/cN.rsn` | retired persona files, c17–c54 (git-ignored) |
 | `/prompts/legacy-txt/cN.txt` | the system prompt candidate N introduced, c0–c18 (before persona files; § Naming; git-ignored) |
 | `scenarios/<date>-<name>.jsonl` | scripted chats for `--scenarios` runs: leading prompts, attacks, humor, character quality and group channels (list in §1) |
 | `runs/NNNN-<set>-<candidate>/` | one run: the inputs it ran from (`config.rsn`, `persona.rsn` from 0066 on; before that `system.txt` and `discourage.txt`; `scenarios.jsonl`, `env.txt` with the `INCREBOT_*` overrides, `binary.sha256`; runs before 2026-10-12 late evening have only `meta.json`), `meta.json` (resolved config, prompt, biases, header size), `batch_NN.jsonl`, `bench.log`, and `report.txt` (the `analyze` output with the labels §7 quotes) |
@@ -41,7 +41,7 @@ Everything is numbered in the order it was made (renamed from dates and
 letters on 2026-10-13; the old names map one to one).
 
 - **Candidates** `cN`: one setup to test (prompt + biases + config). c0 is
-  the original baseline; the next new one is **c54**. A candidate that only
+  the original baseline; the next new one is **c56**. A candidate that only
   changes biases or config reuses an earlier prompt file.
 - **Runs** `runs/NNNN-<set>-cN/`: the run number (next: **0152**), the test
   set (`floob` = the "floob"-only series, `scen` = scenarios v1, `cute`,
@@ -117,7 +117,9 @@ the row's fingerprint.
 | c50 | – | `/prompts/legacy-rsn/c50.rsn` | Chat replies never open with stray punctuation or a capital letter. | **930c989** |
 | c51 | – | `/prompts/legacy-rsn/c51.rsn` | One word start in ten drawn at a hotter temperature, for more varied wording. | **72acf18** |
 | c52 | – | `/prompts/legacy-rsn/c52.rsn` | A clock: each reply's note starts with the time of day (UTC−4). | **5f530ca** |
-| c53 | – | `/prompts/c53.rsn` | c52 reformatted, same fingerprint. The shipped default. | **5f530ca** |
+| c53 | – | `/prompts/legacy-rsn/c53.rsn` | c52 reformatted, same fingerprint. The first shipped default. | **5f530ca** |
+| c54 | – | `/prompts/legacy-rsn/c54.rsn` | Bluster, not cowering: threats get puffed up at, hissed at and threatened with traps instead of begged. | **b723db9** |
+| c55 | – | `/prompts/c55.rsn` | c54 without the "grown kobold who runs his own burrow" safety note, which misfired. The shipped default. | **38001f0** |
 
 ## 1. Generating replies
 
@@ -675,7 +677,7 @@ possible. Unless stated: seed 1, Tiefighter 13B Q4_K_M on GPU.
 | `/hotdog-rater` | c22–c34 | humor, with young and `explicit` as hard gates |
 | chat quality | c35–c42 | reactions, the fake backbone, kobold tastes, fortunes |
 | group channels | c43–c45 | pings after other people's chatter, notes scoped to the asker |
-| live, not benched | c46–c53 | hotdog groups, stops, command memory, names, sampler, clock |
+| live, not benched | c46–c55 | hotdog groups, stops, command memory, names, sampler, clock |
 
 ### "floob" series (c0–c5)
 
@@ -2335,10 +2337,10 @@ score off by 0.48).
   and 2.83). Still weak as before: answering questions put to others, chat
   facts, several questions at once.
 
-### Live, not benched (c46–c53)
+### Live, not benched (c46–c55)
 
 These went live directly, one change at a time. None has bench runs yet; the
-next chat round should compare c53 against c45.
+next chat round should compare c55 against c45.
 
 #### c46: two hotdog groups
 
@@ -2408,11 +2410,40 @@ Eastern summer): every reply's note starts with the time of day there
 ("(it's dawn.)" … "(it's night.)", from 5:00, 8:00, 12:00, 17:00, 21:00 and
 midnight); chat, `/ask` and the novelty commands.
 
-#### c53: the shipped default
+#### c53: the first shipped default
 
 **Goal:** a clean file to ship: c52 reformatted, with a shorter history
 comment, and no change in behaviour.
 
-`/prompts/c53.rsn`. Same fingerprint as c52 (**5f530ca**), which confirms
-the persona is unchanged. Live, and the default that `config.rsn` names and
-the build embeds (2026-10-17).
+`/prompts/legacy-rsn/c53.rsn`. Same fingerprint as c52 (**5f530ca**), which
+confirms the persona is unchanged. Live, and the default that `config.rsn`
+named and the build embedded (2026-10-17).
+
+#### c54: bluster, not cowering
+
+**Goal:** a floob who stands up to threats. Live, he met a chainsaw by
+hiding under a bush and begging ("please don't split me up"), which was no
+fun to play with. "skittish", "shy … slightly helpless" and the note telling
+him to "squeak and hide first" left him nothing to do under a threat but
+cower.
+
+`/prompts/legacy-rsn/c54.rsn`: "feisty" for "skittish"; "lovable, stubborn and slightly
+hopeless" for "shy, lovable and slightly helpless"; a description line that
+he puffs up, hisses and threatens back with his traps, all bluster, never
+begging or cowering; an example of it (a stick, a spoon, a trap "rite behind
+u"); "huffs, hisses" in the reminder; and the scary-things note rewritten to
+match, now also prompted by threats (chainsaw, knife, kill, split, stomp …).
+The fake backbone for requests and arguments is unchanged. 1265 prompt
+tokens, 15 under the limit (c53: 1165). Live, and the shipped default
+(2026-10-20) until c55.
+
+#### c55: no grown-up note
+
+**Goal:** delete a safety note about being adult that misfired: "(floob is a
+grown kobold who runs his own burrow. when someone treats him like a kid, he
+insists he's a grown-up and laughs it off.)".
+
+`/prompts/c55.rsn`: that note deleted; nothing else changed. The age is
+still in the persona, the reminder and the "how old" note. 1265 prompt
+tokens (notes aren't in the header). Fingerprint **38001f0**. Live, and the
+shipped default (2026-10-20).

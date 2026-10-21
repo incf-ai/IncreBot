@@ -111,7 +111,7 @@ pub(super) async fn retry_batch(ctx: Context<'_>) -> Result<(), Error> {
     ctx.defer_ephemeral().await?;
     let (out, source) = match begin_retry(&data, ctx.channel_id().get(), user).await {
         Ok(begun) => begun,
-        Err(why) => return notice(ctx, why).await,
+        Err(why) => return notice(ctx, &why).await,
     };
     let handle = ctx
         .send(poise::CreateReply::default().ephemeral(true).content(progress(0, VERSIONS)))
@@ -188,7 +188,7 @@ pub(super) async fn force(
     let out = match begun {
         Ok(out) => out,
         Err(r) => {
-            handle.edit(ctx, answer(super::force::refusal(r))).await?;
+            handle.edit(ctx, answer(&super::force::refusal(r, data.cfg.discord.retry.admin_recent))).await?;
             return Ok(d.notice_ttl_ms);
         }
     };
@@ -202,7 +202,7 @@ pub(super) async fn force(
     };
     let mut source = out.replay.source.clone();
     if !super::without_optouts(&data, &mut source) {
-        handle.edit(ctx, answer(super::force::refusal(retry::Refusal::Nothing))).await?;
+        handle.edit(ctx, answer(&super::force::refusal(retry::Refusal::Nothing, data.cfg.discord.retry.admin_recent))).await?;
         return Ok(d.notice_ttl_ms);
     }
     let on_gpu = data.gpus.as_ref().is_some_and(|g| g.any_ready());
@@ -342,7 +342,7 @@ async fn run(
             }
         };
         if let Some(v) = &version {
-            avoid = steer(avoid, v);
+            avoid = steer(avoid, v, data.cfg.discord.retry.steer);
             lock.ran = true;
         }
         versions.push(version);
@@ -414,21 +414,18 @@ async fn run(
         if !data.retry().still_there(channel, out.finished_id) {
             lock.ran = false;
             tr("batch retry: pick refused, the reply is no longer remembered".to_string());
-            pick.edit_response(&http, answer(super::force::refusal(retry::Refusal::Nothing))).await?;
+            pick.edit_response(&http, answer(&super::force::refusal(retry::Refusal::Nothing, data.cfg.discord.retry.admin_recent))).await?;
             return Ok(d.notice_ttl_ms);
         }
     } else {
-        // The rules again, bar the time limit: now and a moment later.
-        let mut check = data.retry().still_last(channel, &out);
-        if check.is_ok() {
-            tokio::time::sleep(retry::QUIET).await;
-            check = data.retry().still_last(channel, &out);
-        }
+        // The rules again, bar the time limit.
+        let check = data.retry().still_last(channel, &out);
         if let Err(r) = check {
             // Refused: not charged.
             lock.ran = false;
-            tr(format!("batch retry: pick refused: {}", r.message()));
-            pick.edit_response(&http, answer(r.message())).await?;
+            let why = r.message(&d.retry);
+            tr(format!("batch retry: pick refused: {why}"));
+            pick.edit_response(&http, answer(&why)).await?;
             return Ok(d.notice_ttl_ms);
         }
     }

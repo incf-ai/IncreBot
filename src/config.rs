@@ -364,6 +364,53 @@ pub struct DiscordConfig {
     pub limits: Limits,
     /// The pause between a channel's replies to its messages.
     pub channel_limits: ChannelLimits,
+    /// When `/retry`, `/undo-retry` and `/delete-reply` may go ahead.
+    pub retry: RetryRules,
+}
+
+/// `/retry`'s rules and its relatives' (`chat::retry`, design.md §6).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename = "Retry")]
+pub struct RetryRules {
+    /// A reply can be retried (or a retry undone) this long after it first
+    /// finished, in seconds.
+    pub window_secs: u64,
+    /// At most this many messages floob can see may have come after it.
+    pub max_newer: usize,
+    /// `/delete-reply` checks again this much later that nothing came since.
+    pub delete_quiet_ms: u64,
+    /// How many earlier outputs a retry steers away from (DRY and the
+    /// repetition penalty).
+    pub steer: usize,
+    /// How many retries `/undo-retry` can go back through; past this the
+    /// oldest retry goes, the original stays.
+    pub undo_depth: usize,
+    /// How many of each channel's outputs "Admin actions" can reach, the last
+    /// included.
+    pub admin_recent: usize,
+}
+
+impl RetryRules {
+    pub fn window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.window_secs)
+    }
+
+    pub fn delete_quiet(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.delete_quiet_ms)
+    }
+}
+
+impl Default for RetryRules {
+    fn default() -> Self {
+        Self {
+            window_secs: 300,
+            max_newer: 5,
+            delete_quiet_ms: 1_000,
+            steer: 3,
+            undo_depth: 10,
+            admin_recent: 20,
+        }
+    }
 }
 
 /// Limits on the commands that make the bot generate (`/ask`, the novelty
@@ -567,6 +614,7 @@ impl Default for DiscordConfig {
             retrying_ttl_ms: 3_500,
             limits: Limits::default(),
             channel_limits: ChannelLimits::default(),
+            retry: RetryRules::default(),
         }
     }
 }
@@ -621,6 +669,17 @@ impl Config {
         ensure!(
             l.windows.iter().all(|w| w.count >= 1 && w.ms > 0),
             "limits: every window needs count >= 1 and ms > 0"
+        );
+        let rr = &d.retry;
+        ensure!(
+            rr.undo_depth >= 1 && rr.admin_recent >= 1,
+            "retry: undo_depth and admin_recent must be at least 1"
+        );
+        // The delete holds the channel's retry lock while it waits.
+        ensure!(
+            rr.delete_quiet_ms <= 10_000,
+            "retry: delete_quiet_ms must be <= 10000, got {}",
+            rr.delete_quiet_ms
         );
         let c = &d.channel_limits;
         ensure!(
@@ -874,6 +933,12 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let c = Config::load(&root.join("config.rsn"), &no_env).unwrap();
         assert_eq!(c.model.linear_impl, LinearImpl::Packed);
+        // It spells out the retry rules' defaults.
+        let (r, d) = (&c.discord.retry, RetryRules::default());
+        assert_eq!(
+            (r.window_secs, r.max_newer, r.delete_quiet_ms, r.steer, r.undo_depth, r.admin_recent),
+            (d.window_secs, d.max_newer, d.delete_quiet_ms, d.steer, d.undo_depth, d.admin_recent)
+        );
         // The persona it names loads and fits the context.
         let p = crate::persona::Persona::load(&root.join(&c.discord.persona_file), &no_env).unwrap();
         p.check_against(&c).unwrap();
@@ -982,9 +1047,30 @@ mod tests {
         assert!(bad(&|c| c.discord.bot_name = "flo:ob".into()).contains("bot_name"));
         assert!(bad(&|c| c.discord.bot_name = "a\nb".into()).contains("bot_name"));
         assert!(bad(&|c| c.discord.bot_name = " ".into()).contains("empty"));
+        assert!(bad(&|c| c.discord.retry.undo_depth = 0).contains("undo_depth"));
+        assert!(bad(&|c| c.discord.retry.admin_recent = 0).contains("admin_recent"));
+        assert!(bad(&|c| c.discord.retry.delete_quiet_ms = 10_001).contains("delete_quiet_ms"));
         let mut ok = Config::default();
         ok.runtime.threads = 22;
         ok.validate().unwrap();
+    }
+
+    #[test]
+    fn retry_rules_from_the_file() {
+        let dir = std::env::temp_dir().join(format!("increbot-cfg-retry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.rsn");
+        let load = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            Config::load(&path, &no_env).map_err(|e| format!("{e:#}"))
+        };
+        let c = load("{ discord: { retry: Retry { max_newer: 2, window_secs: 90 } } }").unwrap();
+        let r = &c.discord.retry;
+        assert_eq!((r.max_newer, r.window_secs, r.undo_depth, r.steer), (2, 90, 10, 3), "the rest default");
+        assert_eq!(r.window(), std::time::Duration::from_secs(90));
+        assert!(load("{ discord: { retry: { max_newr: 2 } } }").unwrap_err().contains("max_newr"));
+        assert!(load("{ discord: { retry: { undo_depth: 0 } } }").unwrap_err().contains("undo_depth"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

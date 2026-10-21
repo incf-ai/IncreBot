@@ -728,6 +728,10 @@ pub(super) fn seed_messages(
             seed_command_reply(ctx, &names, window, m);
             continue;
         }
+        if ours && let Some(interaction) = card_part_of(bot, m) {
+            seed_follow_up(ctx, window, m, interaction);
+            continue;
+        }
         let mut msg = window_msg(m, ctx.bot_roles, ctx.bot_name);
         if ours {
             // The bot's notices aren't its words: a leftover notice message
@@ -766,54 +770,75 @@ fn seed_command_reply(c: &SeedCtx, names: &HashMap<u64, String>, window: &mut Ch
         return;
     };
     let (interaction, requester) = (meta.id.get(), meta.user.id.get());
-    let mut text = window_msg(m, bot_roles, bot_name).text;
-    if meta.original_response_message_id.is_none() {
-        // The first message: the header tops it.
-        let (header, body) = m.content.split_once('\n').unwrap_or((&m.content, ""));
-        if !command_of(header).is_some_and(|c| persona.remembers(c)) {
-            return;
-        }
-        let mut users = m.mentions.clone();
-        users.push(meta.user.clone());
-        // Anyone the card names by their name here (as their messages are
-        // labeled), else as Discord lists them.
-        let resolve = |t: &str| {
-            let mut t = t.to_string();
-            for id in remember::mentioned(t.as_str()) {
-                if let Some(n) = names.get(&id) {
-                    t = t.replace(&format!("<@{id}>"), &format!("@{n}")).replace(&format!("<@!{id}>"), &format!("@{n}"));
-                }
-            }
-            resolve_mentions(&t, &users, bot_roles, bot_name)
-        };
-        let name = names.get(&requester).cloned().unwrap_or_else(|| clean_name(meta.user.display_name()));
-        let Some(mut asked) = remember::asked(header, interaction, (requester, &name), &resolve) else {
-            return;
-        };
-        asked.turn.mentions = remember::mentioned(header)
-            .into_iter()
-            .filter_map(|id| names.get(&id).cloned().or_else(|| users.iter().find(|u| u.id.get() == id).map(super::mention_name)))
-            .collect();
-        if asked.about.iter().any(|&u| hidden(u, m.id.get())) || hidden(requester, m.id.get()) {
-            return;
-        }
-        window.push_tied(asked.turn, m.id.get(), asked.about, max);
-        if !window.contains(interaction) {
-            // Asked before the window's anchor: an exchange lives and dies
-            // whole, so no reply without the question (the live window drops
-            // the answer when the anchor passes the turn, `prune_ties`).
-            return;
-        }
-        text = resolve_mentions(body, &m.mentions, bot_roles, bot_name);
-    } else if !window.contains(interaction) {
-        // A follow-up of an exchange that isn't in the window.
+    if meta.original_response_message_id.is_some() {
+        return seed_follow_up(c, window, m, interaction);
+    }
+    // The first message: the header tops it.
+    let (header, body) = m.content.split_once('\n').unwrap_or((&m.content, ""));
+    if !command_of(header).is_some_and(|c| persona.remembers(c)) {
         return;
     }
-    let text = remember::without_notices(&text);
+    let mut users = m.mentions.clone();
+    users.push(meta.user.clone());
+    // Anyone the card names by their name here (as their messages are
+    // labeled), else as Discord lists them.
+    let resolve = |t: &str| {
+        let mut t = t.to_string();
+        for id in remember::mentioned(t.as_str()) {
+            if let Some(n) = names.get(&id) {
+                t = t.replace(&format!("<@{id}>"), &format!("@{n}")).replace(&format!("<@!{id}>"), &format!("@{n}"));
+            }
+        }
+        resolve_mentions(&t, &users, bot_roles, bot_name)
+    };
+    let name = names.get(&requester).cloned().unwrap_or_else(|| clean_name(meta.user.display_name()));
+    let Some(mut asked) = remember::asked(header, interaction, (requester, &name), &resolve) else {
+        return;
+    };
+    asked.turn.mentions = remember::mentioned(header)
+        .into_iter()
+        .filter_map(|id| names.get(&id).cloned().or_else(|| users.iter().find(|u| u.id.get() == id).map(super::mention_name)))
+        .collect();
+    if asked.about.iter().any(|&u| hidden(u, m.id.get())) || hidden(requester, m.id.get()) {
+        return;
+    }
+    window.push_tied(asked.turn, m.id.get(), asked.about, max);
+    if !window.contains(interaction) {
+        // Asked before the window's anchor: an exchange lives and dies
+        // whole, so no reply without the question (the live window drops
+        // the answer when the anchor passes the turn, `prune_ties`).
+        return;
+    }
+    let text = remember::without_notices(&resolve_mentions(body, &m.mentions, bot_roles, bot_name));
     if !text.is_empty() {
         window.push(WindowMsg { text, ..window_msg(m, bot_roles, bot_name) }, max);
+        window.tie_another(interaction, m.id.get());
+    }
+}
+
+/// A later message of the exchange `interaction` (a follow-up, or a retry's
+/// extra part): its text below the rest, if the exchange is in the window.
+fn seed_follow_up(c: &SeedCtx, window: &mut ChannelWindow, m: &serenity::Message, interaction: u64) {
+    if !window.contains(interaction) {
+        return;
+    }
+    let text = remember::without_notices(&window_msg(m, c.bot_roles, c.bot_name).text);
+    if !text.is_empty() {
+        window.push(WindowMsg { text, ..window_msg(m, c.bot_roles, c.bot_name) }, c.max);
         // A follow-up leaves with the exchange (deleted, opted out).
         window.tie_another(interaction, m.id.get());
+    }
+}
+
+/// The exchange a plain message of the bot's continues: a retried card's
+/// extra part replies to the card (`reply::Sink::post`). The card deleted,
+/// Discord no longer says what it replied to; the part then reads as the
+/// bot's own turn (a known gap, design.md §6).
+fn card_part_of(bot: u64, m: &serenity::Message) -> Option<u64> {
+    let card = m.referenced_message.as_deref().filter(|r| r.author.id.get() == bot && is_command_reply(r))?;
+    match card.interaction_metadata.as_deref()? {
+        serenity::MessageInteractionMetadata::Command(meta) => Some(meta.id.get()),
+        _ => None,
     }
 }
 

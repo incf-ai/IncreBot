@@ -645,7 +645,7 @@ async fn post(ctx: Context<'_>, ch: ChannelId, text: String, kind: Kind) -> (Str
     };
     // A reply before it there is no longer the newest thing (`pre_command`
     // only saw the command's channel).
-    data.retry().note_activity(ch.get(), m.id.get());
+    data.retry().note_bot_post(ch.get(), m.id.get());
     // The gateway skips the bot's own messages: add it here.
     data.windows
         .lock()

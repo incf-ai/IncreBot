@@ -334,6 +334,7 @@ pub fn framework(
 ) -> (poise::Framework<Data, Error>, Data) {
     let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel();
     let novelty_key = seeded::Key::new(cfg.discord.novelty_key);
+    let retry_rules = cfg.discord.retry.clone();
     let shared = Arc::new(Shared {
         novelty_key,
         cfg,
@@ -357,7 +358,7 @@ pub fn framework(
         last_prompts: Default::default(),
         optouts,
         shutting_down: AtomicBool::new(false),
-        retry: Default::default(),
+        retry: Mutex::new(retry::Book::new(retry_rules)),
         batch_cooldowns: Default::default(),
         limits: Default::default(),
         command_holds: Default::default(),
@@ -400,8 +401,8 @@ pub fn framework(
             ],
             // Any command but `/retry`, `/retry-batch`, `/undo-retry`, `/delete-reply`,
             // "Admin actions" and "Reply actions" counts
-            // as activity: a reply it follows is no longer the newest thing in
-            // the channel (`chat::retry`).
+            // as activity: a reply it follows can no longer be deleted
+            // (`chat::retry`; retries don't count commands).
             pre_command: |ctx| {
                 Box::pin(async move {
                     if !matches!(&*ctx.command().name, "retry" | "retry-batch" | "undo-retry" | "delete-reply" | "admin_actions" | "reply_actions") {
@@ -513,6 +514,19 @@ async fn on_event(
             let Some(text) = &event.content else {
                 return Ok(());
             };
+            // What a retry counts follows the edit, as the window does below
+            // (a channel without a window too): edited into a `//` message,
+            // it stops counting; back out of one, it counts again.
+            let author = event.author.as_ref().map(|a| a.id.get());
+            let hidden = author.is_some_and(|a| data.optouts.hidden(a, event.id.get()));
+            data.retry().gateway_edit(
+                event.channel_id.get(),
+                event.id.get(),
+                author,
+                data.bot_id(),
+                is_ignored_text(text),
+                hidden,
+            );
             let mut windows = data.windows.lock().await;
             if let Some(w) = windows.get_mut(&event.channel_id.get()) {
                 // The bot's own turns change only through the reply code, with
@@ -543,14 +557,14 @@ async fn on_event(
                 // Edited back out of a `//` message: it becomes visible
                 // again, as a restart's seed would make it. The author must
                 // not be the bot (guarded above), opted out, or unknown
-                // (some update events carry no author).
+                // (some update events carry no author); another bot is
+                // fine, as its messages enter the window like anyone's.
                 if !w.contains(event.id.get()) {
                     // `hidden`, not just `is_out`: editing a message from
                     // before an opt-in doesn't make it visible — it is still
                     // from the hidden period, and a cold start skips it.
                     if let Some(author) = &event.author
                         && author.id.get() != data.bot_id()
-                        && !author.bot
                         && !data.optouts.hidden(author.id.get(), event.id.get())
                     {
                         let name = event
@@ -581,6 +595,7 @@ async fn on_event(
             deleted_message_id,
             ..
         } => {
+            data.retry().unnote_message(channel_id.get(), deleted_message_id.get());
             if let Some(w) = data.windows.lock().await.get_mut(&channel_id.get()) {
                 w.remove(deleted_message_id.get());
             }
@@ -593,11 +608,16 @@ async fn on_event(
 
 async fn on_message(ctx: &serenity::Context, data: &Data, msg: &serenity::Message) {
     let bot_id = data.bot_id();
-    // Any message but the bot's own, `//` and opted-out ones included, means a
-    // reply before it can't be retried (only the ID is kept).
-    if msg.author.id.get() != bot_id {
-        data.retry().note_activity(msg.channel_id.get(), msg.id.get());
-    }
+    // `/retry` and `/delete-reply` bookkeeping: the bot's own post, or
+    // anyone's message (`//` and opted-out ones block a delete too).
+    data.retry().gateway_message(
+        msg.channel_id.get(),
+        msg.id.get(),
+        msg.author.id.get(),
+        bot_id,
+        is_ignored_text(&msg.content),
+        data.optouts.is_out(msg.author.id.get()),
+    );
     // The bot's own messages enter history only via the reply code, with final text.
     // `//` messages and opted-out users are invisible to the bot (no reply, no history).
     if msg.author.id.get() == bot_id
@@ -1063,10 +1083,16 @@ async fn queue_reply(
                             .allowed_mentions(serenity::CreateAllowedMentions::new()),
                     )
                     .await?;
+                let posted = handle.message().await.ok().map(|m| m.id.get());
+                // A newer post than the channel's last output: that can't be
+                // retried now.
+                if let Some(id) = posted {
+                    data.retry().note_bot_post(ctx.channel_id().get(), id);
+                }
                 if let Some(a) = replay.source.remembered(&data.persona().persona)
-                    && let Ok(m) = handle.message().await
+                    && let Some(id) = posted
                 {
-                    reply::remember(&data, ctx.channel_id().get(), a, m.id.get(), Vec::new()).await;
+                    reply::remember(&data, ctx.channel_id().get(), a, id, Vec::new()).await;
                 }
             }
             let busy = busy();
@@ -1768,25 +1794,18 @@ async fn optin(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
-/// The checks `/retry` and `/retry-batch` share (`chat::retry`): rules 1 and
-/// 3–4, then rule 2 after [`retry::QUIET`], then
-/// the opt-outs since. On success the channel's retry lock is held (released
+/// The checks `/retry` and `/retry-batch` share (`chat::retry`): rules 1–4,
+/// then the opt-outs since. On success the channel's retry lock is held (released
 /// by `retry().end`) and the output with the source to generate it from is
 /// returned; else the reason.
-async fn begin_retry(data: &Data, channel: u64, user: u64) -> Result<(retry::Output<Replay>, Source), &'static str> {
+async fn begin_retry(data: &Data, channel: u64, user: u64) -> Result<(retry::Output<Replay>, Source), String> {
+    let rules = &data.cfg.discord.retry;
     let begun = data.retry().begin(channel, user, Instant::now());
-    let out = begun.map_err(retry::Refusal::message)?;
-    let refuse = |r: retry::Refusal| {
-        data.retry().end(channel);
-        r.message()
-    };
-    // Nobody may post for a moment after the command either.
-    tokio::time::sleep(retry::QUIET).await;
-    let quiet = data.retry().still_quiet(channel, &out);
-    quiet.map_err(refuse)?;
+    let out = begun.map_err(|r| r.message(rules))?;
     let mut source = out.replay.source.clone();
     if !without_optouts(data, &mut source) {
-        return Err(refuse(retry::Refusal::Nothing));
+        data.retry().end(channel);
+        return Err(retry::Refusal::Nothing.message(rules));
     }
     Ok((out, source))
 }
@@ -1809,7 +1828,7 @@ async fn do_retry(data: &Data, http: Arc<serenity::Http>, channel: ChannelId, us
         Ok(begun) => begun,
         Err(why) => {
             data.limit_release(hold);
-            return (why.to_string(), d.notice_ttl_ms);
+            return (why, d.notice_ttl_ms);
         }
     };
     data.trace_source(channel.get(), &out.replay.source, format!("/retry by user {user}"));
@@ -1835,7 +1854,7 @@ async fn do_undo(data: &Data, http: Arc<serenity::Http>, channel: ChannelId, use
     let begun = data.retry().begin_undo(channel.get(), user, Instant::now());
     let (cur, prev) = match begun {
         Ok(pair) => pair,
-        Err(r) => return (r.undo_message().to_string(), d.notice_ttl_ms),
+        Err(r) => return (r.undo_message(&d.retry), d.notice_ttl_ms),
     };
     let restored = reply::restore(http, channel, data, &cur, prev).await;
     let ok = restored.is_some();
@@ -1859,14 +1878,14 @@ async fn do_delete(data: &Data, http: Arc<serenity::Http>, channel: ChannelId, u
     let begun = data.retry().begin_delete(ch, user);
     let out = match begun {
         Ok(out) => out,
-        Err(r) => return (r.delete_message().to_string(), d.notice_ttl_ms),
+        Err(r) => return (r.delete_message(&d.retry), d.notice_ttl_ms),
     };
     // Nobody may post for a moment after it either, as with `/retry`.
-    tokio::time::sleep(retry::QUIET).await;
+    tokio::time::sleep(d.retry.delete_quiet()).await;
     let quiet = data.retry().still_quiet(ch, &out);
     if let Err(r) = quiet {
         data.retry().end_delete(ch, false);
-        return (r.delete_message().to_string(), d.notice_ttl_ms);
+        return (r.delete_message(&d.retry), d.notice_ttl_ms);
     }
     for (id, _) in &out.messages {
         // Already deleted by hand: nothing left to do for it.
@@ -2025,6 +2044,7 @@ async fn delete_reply(ctx: Context<'_>) -> Result<(), Error> {
 /// froze when they were asked.
 async fn forget_author(data: &Shared, user: u64) {
     data.traces.forget_author(user);
+    data.retry().forget_author(user);
     let channels: Vec<u64> = data
         .windows
         .lock()

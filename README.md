@@ -31,7 +31,7 @@ backend. No llama.cpp, no Python, no inference server.
   ([PRIVACY.md](PRIVACY.md)).
 
 The persona (prompt, notes, word biases, stop strings, sampler settings) is one
-file, [prompts/c53.rsn](prompts/c53.rsn), named by
+file, [prompts/c55.rsn](prompts/c55.rsn), named by
 [config.rsn](config.rsn). Admins can reload it live.
 
 ## Running it

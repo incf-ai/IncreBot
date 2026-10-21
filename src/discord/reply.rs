@@ -191,9 +191,18 @@ impl<'a> Sink<'a> {
                     // Deleted meanwhile: it no longer holds anything.
                     reuse.gone(id);
                 }
-                let msg = CreateMessage::new()
+                let mut msg = CreateMessage::new()
                     .content(reuse.fresh(text, first))
                     .allowed_mentions(no_pings());
+                // A card's extra part replies to the card: the REST seed
+                // reads it as that command's follow-up, not the bot's own
+                // turn (`dispatch::seed_messages`).
+                if let Some(card) = reuse.card() {
+                    let to = serenity::MessageReference::new(serenity::MessageReferenceKind::Default, *channel)
+                        .message_id(MessageId::new(card))
+                        .fail_if_not_exists(false);
+                    msg = msg.reference_message(to);
+                }
                 match channel.send_message(&**http, msg).await {
                     Ok(m) => {
                         reuse.posted(m.id.get(), first);
@@ -280,13 +289,17 @@ impl<'a> Sink<'a> {
         header.map_or(0, |h| h.chars().count() + 1)
     }
 
-    /// A retry that finished: deletes the old messages it didn't need.
-    async fn drop_unused(&mut self) {
+    /// A retry that finished: deletes the old messages it didn't need. Each
+    /// one deleted leaves `/retry`'s count at once, not when the gateway's
+    /// delete event arrives (or doesn't).
+    async fn drop_unused(&mut self, data: &Data) {
         let Sink::Redo { http, channel, reuse, .. } = self else {
             return;
         };
         for id in reuse.leftovers() {
-            let _ = channel.delete_message(&**http, MessageId::new(id)).await;
+            if channel.delete_message(&**http, MessageId::new(id)).await.is_ok() {
+                data.retry().unnote_message(channel.get(), id);
+            }
         }
     }
 
@@ -322,7 +335,7 @@ impl<'a> Sink<'a> {
 
     /// Deletes a posted message; the header message goes back to the header alone,
     /// and an old message a retry reused gets its old text back.
-    async fn delete(&self, posted: &Posted<'a>) {
+    async fn delete(&self, posted: &Posted<'a>, data: &Data) {
         if let Sink::Redo { reuse, .. } = self
             && let Some(old) = reuse.original(posted.id().get())
         {
@@ -354,10 +367,15 @@ impl<'a> Sink<'a> {
             }
             return;
         }
-        let _ = self
+        // Deleted, it leaves `/retry`'s count at once, as in `drop_unused`.
+        if self
             .channel()
             .delete_message(&*self.http(), posted.id())
-            .await;
+            .await
+            .is_ok()
+        {
+            data.retry().unnote_message(self.channel().get(), posted.id().get());
+        }
     }
 }
 
@@ -721,7 +739,7 @@ pub async fn stream<'a>(
                     )
                     .await;
                 } else {
-                    sink.delete(&p).await;
+                    sink.delete(&p, &data).await;
                 }
             }
         }
@@ -750,7 +768,7 @@ pub async fn stream<'a>(
                     final_parts.push((id, body));
                 }
             }
-            sink.drop_unused().await;
+            sink.drop_unused(&data).await;
             tr(match &sink {
                 Sink::Redo { .. } => format!("written over the earlier reply ({} message(s))", held.len()),
                 _ => format!("posted in {} message(s)", held.len()),
@@ -764,7 +782,7 @@ pub async fn stream<'a>(
                 let said = final_parts.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join("\n");
                 writing.output = Some(Output {
                     replay: Replay {
-                        avoid: steer(replay.avoid, &said),
+                        avoid: steer(replay.avoid, &said, data.cfg.discord.retry.steer),
                         ..replay
                     },
                     requester,
@@ -861,7 +879,7 @@ pub async fn restore(
     if messages.is_empty() {
         return None;
     }
-    sink.drop_unused().await;
+    sink.drop_unused(data).await;
     if let Sink::Redo { reuse, history: true, .. } = &sink {
         let tied = cur.replay.source.remembered(&data.persona().persona).map(|a| a.turn.id);
         write_turn(data, channel.get(), &reuse.old_ids(), turn.clone(), tied).await;

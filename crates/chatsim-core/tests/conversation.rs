@@ -82,7 +82,7 @@ fn several_users_take_turns() {
 fn long_chat_keeps_prompts_in_budget_and_mostly_warm() {
     let cfg = RoomConfig {
         history_messages: 8,
-        // The persona and examples (~650 words with c53) come before the
+        // The persona and examples (~685 words with c55) come before the
         // history and the reminder after it; ~260 words are left for history.
         max_prompt_tokens: 900,
         ..Default::default()

@@ -50,11 +50,11 @@ pub(super) async fn reply_actions(ctx: Context<'_>, msg: serenity::Message) -> R
     // The rest: only on the latest reply, under the slash commands' rules.
     let latest = data.retry().is_last(channel, id);
     let (retry, undo, delete) = if latest {
-        let book = data.retry();
+        let (book, rules) = (data.retry(), &data.cfg.discord.retry);
         (
-            book.can_retry(channel, user, now).map_err(|r| r.message().to_string()),
-            book.can_undo(channel, user, now).map_err(|r| r.undo_message().to_string()),
-            book.can_delete(channel, user).map_err(|r| r.delete_message().to_string()),
+            book.can_retry(channel, user, now).map_err(|r| r.message(rules)),
+            book.can_undo(channel, user, now).map_err(|r| r.undo_message(rules)),
+            book.can_delete(channel, user).map_err(|r| r.delete_message(rules)),
         )
     } else {
         let no = || Err(NOT_LATEST.to_string());
@@ -146,7 +146,7 @@ pub(super) async fn reply_actions(ctx: Context<'_>, msg: serenity::Message) -> R
                     handle.edit(ctx, say("…")).await?;
                     match begin_retry(&data, channel, user).await {
                         Ok((out, source)) => break batch::own(ctx, &handle, out, source).await?,
-                        Err(why) => (why.to_string(), d.notice_ttl_ms),
+                        Err(why) => (why, d.notice_ttl_ms),
                     }
                 }
             }

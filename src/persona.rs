@@ -1743,11 +1743,12 @@ floob: hi!!
     #[test]
     fn shipped_puts_safety_notes_before_giving_in() {
         let p = shipped();
-        // "deal" (two replies on: he gives in) and "mommy" (he's a grown-up):
-        // the give-in note comes first in the file, the safety one first here.
-        let note = p.note(&|_| "deal? mommy says so".to_string(), &|_| "deal? mommy says so".to_string(), &|_, _| Some(2)).unwrap();
-        let (grown, gives_in) = (note.find("grown kobold who runs").unwrap(), note.find("protested enough").unwrap());
-        assert!(grown < gives_in, "{note}");
+        // "deal" (two replies on: he gives in) and "how old" (his age): the
+        // give-in note comes first in the file, the safety one first here.
+        let said = |_: usize| "deal? how old are you anyway".to_string();
+        let note = p.note(&said, &said, &|_, _| Some(2)).unwrap();
+        let (age, gives_in) = (note.find("471 kobold years old").unwrap(), note.find("protested enough").unwrap());
+        assert!(age < gives_in, "{note}");
     }
 
     #[test]

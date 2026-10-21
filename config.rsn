@@ -31,7 +31,7 @@ Config {
     },
 
     generation: Generation {
-        max_prompt_tokens:  2560, // persona + template (~1170 with c53), the rest history
+        max_prompt_tokens:  2560, // persona + template (~1265 with c55), the rest history
         max_message_tokens: 120,  // per-message cap before "…"; must be < max_prompt_tokens / 2
         max_header_tokens:  0,    // persona + template; 0 = half of max_prompt_tokens (1280)
         cpu_drop_persona_repeat: true,  // no persona or recent-messages copy after the history while
@@ -42,7 +42,7 @@ Config {
 
     discord: Discord {
         bot_name:           "IncreBot",
-        persona_file:       "prompts/c53.rsn",  // how the bot replies: prompt, notes, word biases,
+        persona_file:       "prompts/c55.rsn",  // how the bot replies: prompt, notes, word biases,
                                       // sampler, reply length (persona-plan.md); /super-admin persona-reload re-reads it
         optout_file:        "data/optouts.json",  // /opt-out list; written by the bot
         history_messages:   20,   // floob remembers the last 10–20 messages (the anchor drops the older half)
@@ -67,6 +67,15 @@ Config {
                                   // a new key re-rolls everyone. 0 works but is no secret.
         notice_ttl_ms:      7500, // ephemeral refusals and "busy" delete themselves after this; 0 = never
         retrying_ttl_ms:    3500, // the same for /retry's "Retrying…"
+        // /retry, /retry-batch, /undo-retry, /delete-reply and the "Admin actions" menu.
+        retry: Retry {
+            window_secs:      300,  // a reply can be retried or undone this long after it first finished
+            max_newer:        5,    // at most this many messages floob can see may have come since
+            delete_quiet_ms:  1000, // /delete-reply looks again this much later that nothing came since; <= 10000
+            steer:            3,    // a retry steers away from this many earlier outputs
+            undo_depth:       10,   // /undo-retry goes back through this many retries; >= 1
+            admin_recent:     20,   // "Admin actions" reaches each channel's last this many outputs; >= 1
+        },
         // How often someone not an admin may make floob generate by command (/ask, the
         // novelty commands, /retry, /retry-batch; chatting doesn't count), across channels.
         limits: Limits {
