@@ -104,4 +104,21 @@ Config {
         },
         // prompt_template: r#"..."#,  // minijinja; defaults to the Alpaca-style template in design.md §7
     },
+
+    // /classify-text and /classify-image: yes/no questions answered by LiquidAI's d1-3B.
+    // Uses the same per-user limits as /ask.
+    classify: Classify {
+        classify_enabled:        false,  // load d1 (~2 GB) at startup and offer the commands
+        classify_repo:           "LiquidAI/d1-3B-GGUF",
+        classify_file:           "d1-3B-Q4_K_M.gguf",       // Q4_K_M is the only kind the GPU takes
+        classify_mmproj:         "mmproj-d1-3B-Q8_0.gguf",  // vision tower, for /classify-image
+        classify_tokenizer_repo: "LiquidAI/d1-3B",
+        classify_gpu:            "",     // PCI address to run d1 on, always (not managed like
+                                         // runtime.gpus); "" = CPU (~0.7 s per question)
+        classify_max_text_tokens: 1500,  // longer text is turned away
+        max_image_bytes:         8388608,   // larger attachments are turned away unread
+        max_image_pixels:        40000000,  // so are images with more pixels, judged from the header
+        image_max_side:          640,    // images are scaled to at most this on the longer side
+        max_audio_secs:          30,     // longer clips are turned away; d1 hears at most 30 s
+    },
 }

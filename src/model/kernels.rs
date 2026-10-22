@@ -43,6 +43,55 @@ pub fn rope(x: &mut [f32], heads: usize, head_dim: usize, pos0: usize, cos: &[f3
         });
 }
 
+/// Half-split (NeoX) RoPE in place: within each head, element `i` pairs with
+/// `i + head_dim / 2`, rotated by angle `pos · θ_i`. Same tables as [`rope`]. LFM2
+/// uses this one; its GGUF keeps the q/k weights in HF order.
+pub fn rope_neox(x: &mut [f32], heads: usize, head_dim: usize, pos0: usize, cos: &[f32], sin: &[f32]) {
+    let half = head_dim / 2;
+    x.par_chunks_mut(heads * head_dim)
+        .enumerate()
+        .for_each(|(row, tok)| {
+            let c = &cos[(pos0 + row) * half..][..half];
+            let s = &sin[(pos0 + row) * half..][..half];
+            for head in tok.chunks_exact_mut(head_dim) {
+                let (lo, hi) = head.split_at_mut(half);
+                for i in 0..half {
+                    let (a, b) = (lo[i], hi[i]);
+                    lo[i] = a * c[i] - b * s[i];
+                    hi[i] = a * s[i] + b * c[i];
+                }
+            }
+        });
+}
+
+/// LFM2's gated short convolution on `bcx: [t, 3 · width]` (the `in_proj`
+/// output, split as `b | c | x`): `c · conv(b · x)`, with a causal depthwise
+/// kernel of `taps` taps per channel (`kernel: [width, taps]`, oldest tap
+/// first). `state: [taps - 1, width]` holds the `b · x` rows before this chunk,
+/// oldest first, and is advanced to end with this chunk's last rows.
+pub fn short_conv(bcx: &[f32], width: usize, kernel: &[f32], taps: usize, state: &mut [f32]) -> Vec<f32> {
+    let t = bcx.len() / (3 * width);
+    let keep = taps - 1;
+    // `b · x` for the kept rows and this chunk: [keep + t, width].
+    let mut bx = Vec::with_capacity((keep + t) * width);
+    bx.extend_from_slice(state);
+    for row in bcx.chunks_exact(3 * width) {
+        let (b, rest) = row.split_at(width);
+        bx.extend(b.iter().zip(&rest[width..]).map(|(b, x)| b * x));
+    }
+    let mut out = vec![0f32; t * width];
+    out.par_chunks_mut(width).enumerate().for_each(|(i, o)| {
+        let c = &bcx[i * 3 * width + width..][..width];
+        for (ch, o) in o.iter_mut().enumerate() {
+            let k = &kernel[ch * taps..][..taps];
+            let z: f32 = (0..taps).map(|j| k[j] * bx[(i + j) * width + ch]).sum();
+            *o = c[ch] * z;
+        }
+    });
+    state.copy_from_slice(&bx[t * width..]);
+    out
+}
+
 /// `silu(gate) · up`, elementwise.
 pub fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
     let mut out = vec![0f32; gate.len()];
@@ -312,6 +361,52 @@ mod tests {
                 3.0 * 0.25 + 4.0 * 0.5
             ]
         );
+    }
+
+    #[test]
+    fn rope_neox_rotates_split_halves() {
+        // One token at position 1, one head of dim 4: pairs (0,2) and (1,3).
+        let (cos, sin) = ([1.0, 1.0, 0.0, 0.5], [0.0, 0.0, 1.0, 0.25]);
+        let mut x = [1.0, 2.0, 3.0, 4.0];
+        rope_neox(&mut x, 1, 4, 1, &cos, &sin);
+        assert_eq!(
+            x,
+            [
+                1.0 * 0.0 - 3.0 * 1.0,
+                2.0 * 0.5 - 4.0 * 0.25,
+                1.0 * 1.0 + 3.0 * 0.0,
+                2.0 * 0.25 + 4.0 * 0.5
+            ]
+        );
+    }
+
+    #[test]
+    fn short_conv_is_causal_and_chunks_like_one_pass() {
+        let (width, taps) = (3, 3);
+        let bcx = data(5 * 3 * width, 7);
+        let kernel = data(width * taps, 8);
+        // Naive: zero-padded causal conv of b·x, gated by c.
+        let bx: Vec<f32> = bcx
+            .chunks(3 * width)
+            .flat_map(|r| (0..width).map(move |ch| r[ch] * r[2 * width + ch]))
+            .collect();
+        let mut want = Vec::new();
+        for i in 0..5 {
+            for ch in 0..width {
+                let z: f32 = (0..taps)
+                    .filter(|j| i + j >= taps - 1)
+                    .map(|j| kernel[ch * taps + j] * bx[(i + j - (taps - 1)) * width + ch])
+                    .sum();
+                want.push(bcx[i * 3 * width + width + ch] * z);
+            }
+        }
+        let mut state = vec![0f32; (taps - 1) * width];
+        let mut got = short_conv(&bcx[..2 * 3 * width], width, &kernel, taps, &mut state);
+        got.extend(short_conv(&bcx[2 * 3 * width..], width, &kernel, taps, &mut state));
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-5, "{g} vs {w}");
+        }
+        assert_eq!(state, bx[3 * width..]);
     }
 
     #[test]

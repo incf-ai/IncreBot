@@ -48,6 +48,7 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     pub generation: GenerationConfig,
     pub discord: DiscordConfig,
+    pub classify: ClassifyConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -619,6 +620,51 @@ impl Default for DiscordConfig {
     }
 }
 
+/// The d1 classifier behind `/classify-text` and `/classify-image`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename = "Classify")]
+pub struct ClassifyConfig {
+    /// Load d1 at startup and offer the /classify-* commands.
+    pub classify_enabled: bool,
+    pub classify_repo: String,
+    pub classify_file: String,
+    /// The vision projector GGUF in `classify_repo`, for `/classify-image`.
+    pub classify_mmproj: String,
+    pub classify_tokenizer_repo: String,
+    /// Run d1 on the GPU at this PCI address, always (not managed like
+    /// `runtime.gpus`); empty = CPU.
+    pub classify_gpu: String,
+    /// `/classify-text` turns away text longer than this, in d1 tokens.
+    pub classify_max_text_tokens: usize,
+    /// `/classify-image` turns away attachments larger than this.
+    pub max_image_bytes: u64,
+    /// ... or with more pixels than this, judged from the header before decoding.
+    pub max_image_pixels: u64,
+    /// Images are scaled so their longer side is at most this.
+    pub image_max_side: u32,
+    /// `/classify-audio` turns away clips longer than this.
+    pub max_audio_secs: u32,
+}
+
+impl Default for ClassifyConfig {
+    fn default() -> Self {
+        Self {
+            classify_enabled: false,
+            classify_repo: crate::classify::DEFAULT_REPO.into(),
+            classify_file: crate::classify::DEFAULT_FILE.into(),
+            classify_mmproj: crate::classify::DEFAULT_MMPROJ.into(),
+            classify_tokenizer_repo: crate::classify::TOKENIZER_REPO.into(),
+            classify_gpu: String::new(),
+            classify_max_text_tokens: 1500,
+            max_image_bytes: 8 << 20,
+            max_image_pixels: 40_000_000,
+            image_max_side: 640,
+            max_audio_secs: 30,
+        }
+    }
+}
+
+
 impl Config {
     /// Reads `path` if it exists (defaults otherwise), applies env overrides from
     /// `env`, and validates.
@@ -732,6 +778,31 @@ impl Config {
             !self.discord.bot_name.trim().is_empty(),
             "bot_name must not be empty"
         );
+        let k = &self.classify;
+        ensure!(
+            (64..=4096).contains(&k.image_max_side),
+            "image_max_side must be 64..=4096, got {}",
+            k.image_max_side
+        );
+        ensure!(
+            (1..=30).contains(&k.max_audio_secs),
+            "max_audio_secs must be 1..=30 (d1 hears at most 30 s), got {}",
+            k.max_audio_secs
+        );
+        ensure!(
+            k.classify_max_text_tokens <= 7000,
+            "classify_max_text_tokens must be <= 7000 (d1 runs with at most 8192), got {}",
+            k.classify_max_text_tokens
+        );
+        ensure!(
+            k.max_image_bytes >= 1 && k.max_image_pixels >= 1 && k.classify_max_text_tokens >= 1,
+            "max_image_bytes, max_image_pixels and classify_max_text_tokens must be at least 1"
+        );
+        if !k.classify_gpu.is_empty() {
+            k.classify_gpu
+                .parse::<crate::gpu::PciAddr>()
+                .with_context(|| format!("classify_gpu {:?}", k.classify_gpu))?;
+        }
         let d = &self.discord;
         if let Some(c) = d.dedicated_channels.iter().find(|c| listed(&d.shared_channels, c.id)) {
             bail!("channel {c} is in both dedicated_channels and shared_channels");

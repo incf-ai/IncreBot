@@ -6,6 +6,7 @@
 // attribute here covers all of them.
 #![allow(clippy::print_stderr)]
 
+mod d1;
 mod engine;
 mod gpu;
 mod gpu_sharing;

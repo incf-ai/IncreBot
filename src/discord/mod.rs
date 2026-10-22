@@ -3,6 +3,7 @@
 
 mod actions;
 mod batch;
+mod classify;
 mod dispatch;
 mod force;
 pub mod hotdog;
@@ -69,6 +70,8 @@ pub struct Shared {
     pub stats: Arc<Mutex<EngineStats>>,
     pub resets: ResetHandle,
     pub gpus: Option<Arc<crate::gpu::manager::Gpus>>,
+    /// d1 for `/classify-text`, when `classify.classify_enabled`.
+    pub classify: Option<Arc<classify::Classify>>,
     /// Prefills the persona header ahead of replies (at startup and reload).
     pub seed: crate::engine::worker::SeedHandle,
     /// What the bot was up to in each quiet channel (`chat::idle`).
@@ -331,6 +334,7 @@ pub fn framework(
     active: Active,
     engine: EngineHandle,
     optouts: OptOuts,
+    classifier: Option<crate::classify::Classifier>,
 ) -> (poise::Framework<Data, Error>, Data) {
     let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel();
     let novelty_key = seeded::Key::new(cfg.discord.novelty_key);
@@ -348,6 +352,7 @@ pub fn framework(
         stats: engine.stats.clone(),
         resets: engine.resets.clone(),
         gpus: engine.gpus.clone(),
+        classify: classifier.map(|c| Arc::new(classify::Classify::new(c))),
         seed: engine.seed.clone(),
         idle: Default::default(),
         started: Instant::now(),
@@ -398,6 +403,8 @@ pub fn framework(
                 actions::reply_actions(),
                 undo_retry(),
                 delete_reply(),
+                classify::classify_text(),
+                classify::classify_image(),
             ],
             // Any command but `/retry`, `/retry-batch`, `/undo-retry`, `/delete-reply`,
             // "Admin actions" and "Reply actions" counts

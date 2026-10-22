@@ -2,6 +2,7 @@
 //! See design.md for the full design.
 
 pub mod chat;
+pub mod classify;
 pub mod cli;
 pub mod config;
 pub mod discord;

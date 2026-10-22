@@ -1,0 +1,33 @@
+#version 460
+// LFM2's gated short convolution (kernels::short_conv): y = c · conv(b · x) on
+// bcx [t, 3 · width] (b | c | x per row), a causal depthwise kernel of `taps`
+// taps per channel (kernel [width, taps], oldest first). state [taps - 1, width]
+// holds the b · x rows before this chunk, oldest first, and is advanced. One
+// invocation per channel, walking the chunk's rows in order.
+#include "common.glsl"
+
+#define MAX_TAPS 8
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    F32 bcx; F32 kernel; F32 state; F32 y;
+    uint t; uint width; uint taps;
+} p;
+
+void main() {
+    uint ch = gl_GlobalInvocationID.x;
+    if (ch >= p.width) return;
+    uint keep = p.taps - 1;
+    float k[MAX_TAPS], win[MAX_TAPS];
+    for (uint j = 0; j < p.taps; j++) k[j] = p.kernel.v[ch * p.taps + j];
+    for (uint j = 0; j < keep; j++) win[j] = p.state.v[j * p.width + ch];
+    for (uint i = 0; i < p.t; i++) {
+        uint row = i * 3 * p.width;
+        win[keep] = p.bcx.v[row + ch] * p.bcx.v[row + 2 * p.width + ch];
+        float z = 0.0;
+        for (uint j = 0; j < p.taps; j++) z += k[j] * win[j];
+        p.y.v[i * p.width + ch] = p.bcx.v[row + p.width + ch] * z;
+        for (uint j = 0; j < keep; j++) win[j] = win[j + 1];
+    }
+    for (uint j = 0; j < keep; j++) p.state.v[j * p.width + ch] = win[j];
+}

@@ -74,6 +74,7 @@ pub fn serve(config_path: &Path) -> Result<()> {
     } else {
         Gpus::start(cfg.runtime.gpu_settings(cfg.model.n_ctx)?, model.clone())
     };
+    let classifier = if cfg.classify.classify_enabled { Some(load_classifier(&cfg)?) } else { None };
     let backends = Backends::new(model, gpus, cfg.model.n_ctx);
     let engine = crate::engine::worker::spawn(backends, tok.clone(), cfg.runtime.kv_cache_slots)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -82,7 +83,7 @@ pub fn serve(config_path: &Path) -> Result<()> {
         .build()?;
     rt.block_on(async move {
         use poise::serenity_prelude as serenity;
-        let (framework, shared) = discord::framework(cfg, tok, persona, engine, optouts);
+        let (framework, shared) = discord::framework(cfg, tok, persona, engine, optouts, classifier);
         let mut client = serenity::ClientBuilder::new(token.trim(), discord::intents())
             .framework(framework)
             .await
@@ -91,6 +92,32 @@ pub fn serve(config_path: &Path) -> Result<()> {
         tokio::spawn(signals(shared, shards));
         client.start().await.context("Discord client")
     })
+}
+
+/// d1 for the /classify-* commands (`classify` config section), checked with
+/// one question before the bot goes online.
+fn load_classifier(cfg: &Config) -> Result<crate::classify::Classifier> {
+    use crate::classify::{Classifier, Json, Question};
+    let k = &cfg.classify;
+    let model = hub::resolve(&k.classify_repo, &k.classify_file)?;
+    let tokenizer = hub::resolve(&k.classify_tokenizer_repo, "tokenizer.json")?;
+    // The text, the question and the prompt around them; also the GPU's cap.
+    // A picture is at most 10 tiles and a thumbnail, ~2.8k image tokens.
+    let max_ctx = (k.classify_max_text_tokens + 1024).clamp(4096, 8192);
+    let mut classifier = Classifier::load(&model, &tokenizer, crate::model::LinearImpl::Packed, max_ctx)
+        .context("loading the classifier")?;
+    if !k.classify_gpu.is_empty() {
+        classifier = classifier.with_gpu(k.classify_gpu.parse()?).context("classify_gpu")?;
+    }
+    // Pictures run on the CPU even with a GPU set.
+    let mmproj = hub::resolve(&k.classify_repo, &k.classify_mmproj)?;
+    classifier = classifier.with_vision(&mmproj).context("classify_mmproj")?;
+    let q = Question::Noul { instructions: "Is this a greeting?".into(), criteria: None };
+    let d = classifier.classify(Some(&Json::String("Hello there!".into())), &[("check".into(), q)])?;
+    let yes = d[0].probabilities[0];
+    anyhow::ensure!(yes.is_finite() && yes > 0.5, "classifier self-test: P(yes) = {yes} for a greeting");
+    info!(file = %k.classify_file, gpu = %k.classify_gpu, p_yes = yes, "classifier ready");
+    Ok(classifier)
 }
 
 /// SIGHUP reloads the persona; SIGTERM/SIGINT shut down within ~5 s (design.md

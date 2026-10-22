@@ -9,7 +9,7 @@ use anyhow::Result;
 use super::ModelArgs;
 use crate::gguf::Gguf;
 
-pub fn inspect(model: &ModelArgs) -> Result<()> {
+pub fn inspect(model: &ModelArgs, all: bool) -> Result<()> {
     let g = Gguf::open(&model.path()?)?;
     println!(
         "GGUF v{}, {} tensors, {} metadata keys",
@@ -28,7 +28,7 @@ pub fn inspect(model: &ModelArgs) -> Result<()> {
         *counts.entry(format!("{:?}", t.ty)).or_insert(0) += 1;
     }
     println!("tensor types: {counts:?}");
-    for t in g.tensors.iter().take(12) {
+    for t in g.tensors.iter().take(if all { usize::MAX } else { 12 }) {
         println!("  {} {:?} {:?}", t.name, t.ty, t.dims);
     }
     Ok(())

@@ -1,6 +1,7 @@
 //! The `increbot` command line. The binary (`src/bin/increbot.rs`) only parses
 //! the arguments and calls [`run`]; the commands live here.
 
+mod classify;
 mod generate;
 mod inspect;
 mod serve;
@@ -13,6 +14,7 @@ use clap::{Parser, Subcommand};
 use crate::hub;
 use crate::model::LinearImpl;
 
+pub use classify::ClassifyArgs;
 pub use generate::GenerateArgs;
 
 const DEFAULT_REPO: &str = "TheBloke/LLaMA2-13B-Tiefighter-GGUF";
@@ -42,9 +44,14 @@ enum Cmd {
     Inspect {
         #[command(flatten)]
         model: ModelArgs,
+        /// List every tensor, not just the first 12.
+        #[arg(long)]
+        all: bool,
     },
     /// Generate a continuation of a prompt.
     Generate(GenerateArgs),
+    /// Answer System One questions about a state with a d1 model.
+    Classify(ClassifyArgs),
 }
 
 /// Which GGUF file to use.
@@ -99,8 +106,9 @@ pub fn run(cli: Cli) -> Result<()> {
         .init();
     match cli.cmd {
         Cmd::Serve { config } => serve::serve(&config),
-        Cmd::Inspect { model } => inspect::inspect(&model),
+        Cmd::Inspect { model, all } => inspect::inspect(&model, all),
         Cmd::Generate(args) => generate::generate(args),
+        Cmd::Classify(args) => classify::classify(args),
     }
 }
 
@@ -124,6 +132,8 @@ mod tests {
         assert!(matches!(cli.cmd, Cmd::Inspect { .. }));
         let cli = Cli::try_parse_from(["increbot", "generate", "hi", "--stop", "\n"]).unwrap();
         assert!(matches!(cli.cmd, Cmd::Generate(_)));
+        let cli = Cli::try_parse_from(["increbot", "classify", "{}", "--state", "hi"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Classify(_)));
     }
 
     #[test]

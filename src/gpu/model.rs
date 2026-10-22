@@ -30,7 +30,7 @@ pub const CHUNK: usize = 512;
 
 /// Largest context: split decode attention's partial buffer and positions in
 /// u32 indices stay small.
-const MAX_KEYS: usize = 8192;
+pub(super) const MAX_KEYS: usize = 8192;
 
 /// Keys per workgroup in split decode attention (`attention_split.comp`).
 const SPLIT_KEYS: usize = 128;
@@ -41,11 +41,11 @@ const RING: usize = 2;
 
 /// Where a linear layer's blocks sit inside its layer buffer.
 #[derive(Clone, Copy)]
-struct Linear {
-    off: u64,
-    kind: KQuant,
-    k: u32,
-    n: u32,
+pub(super) struct Linear {
+    pub(super) off: u64,
+    pub(super) kind: KQuant,
+    pub(super) k: u32,
+    pub(super) n: u32,
 }
 
 struct Layer {
@@ -108,13 +108,13 @@ pub enum Interrupted {
     Stopped,
 }
 
-fn round_up(v: u64) -> u64 {
+pub(super) fn round_up(v: u64) -> u64 {
     v.next_multiple_of(256)
 }
 
 /// A linear layer's weights in the GPU's layout: Q4_K blocks as-is; Q6_K
 /// repacked by [`repack_q6k`].
-fn gpu_blocks<'a>(l: &'a dyn QLinear, name: &str) -> Result<(KQuant, Cow<'a, [u8]>)> {
+pub(super) fn gpu_blocks<'a>(l: &'a dyn QLinear, name: &str) -> Result<(KQuant, Cow<'a, [u8]>)> {
     let (kind, blocks) = l.k_blocks().with_context(|| {
         format!("{name}: the GPU backend needs Q4_K/Q6_K weights loaded with linear_impl: Packed")
     })?;
@@ -603,7 +603,7 @@ fn record_layer(
 
 /// How [`matvec`] combines its matrices.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
+pub(super) enum Mode {
     /// Each matrix writes its own output.
     Plain,
     /// One matrix, added to its output (residual).
@@ -613,7 +613,7 @@ enum Mode {
 }
 
 /// `y_i = W_i · x` for one row, for up to three matrices in one dispatch.
-fn matvec(dev: &Device, cmds: &mut Commands, mats: &[((u64, Linear), u64)], x: u64, mode: Mode) -> Result<()> {
+pub(super) fn matvec(dev: &Device, cmds: &mut Commands, mats: &[((u64, Linear), u64)], x: u64, mode: Mode) -> Result<()> {
     assert!((1..=3).contains(&mats.len()));
     let get = |i: usize| mats.get(i).copied();
     let k = mats[0].0.1.k;
@@ -655,14 +655,14 @@ fn matvec(dev: &Device, cmds: &mut Commands, mats: &[((u64, Linear), u64)], x: u
 
 /// The quantized activations [`matmul`] reads: values, scales, sums of 16.
 #[derive(Clone, Copy)]
-struct Quantized {
-    q: u64,
-    d: u64,
-    s: u64,
+pub(super) struct Quantized {
+    pub(super) q: u64,
+    pub(super) d: u64,
+    pub(super) s: u64,
 }
 
 /// Quantizes `m` rows of `k` activations at `x` into `out`.
-fn quantize(
+pub(super) fn quantize(
     dev: &Device,
     cmds: &mut Commands,
     out: Quantized,
@@ -685,7 +685,7 @@ fn quantize(
 }
 
 /// `Y (+)= X · Wᵀ` for `m` rows (prefill), with integer dot products.
-fn matmul(
+pub(super) fn matmul(
     dev: &Device,
     cmds: &mut Commands,
     (addr, w): (u64, Linear),

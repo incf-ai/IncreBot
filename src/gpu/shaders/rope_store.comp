@@ -1,7 +1,8 @@
 #version 460
 // RoPE on Q (in place) and K, and both K and V stored as f16 into the cache at
 // positions pos0.. . One invocation per pair: first Q's pairs, then K's (rotated
-// and stored), then V's (stored).
+// and stored), then V's (stored). Pairs are adjacent elements (2i, 2i + 1), or
+// with NEOX the two halves of each head (i, i + head_dim / 2).
 #include "common.glsl"
 
 layout(local_size_x = 256) in;
@@ -22,16 +23,21 @@ void main() {
         uint row = pg / per_row, i = pg % half_;
         float c = p.cos_.v[(p.pos0 + row) * half_ + i];
         float s = p.sin_.v[(p.pos0 + row) * half_ + i];
+#ifdef NEOX
+        uint ia = (pg / half_) * p.head_dim + i, ib = ia + half_;
+#else
+        uint ia = 2 * pg, ib = 2 * pg + 1;
+#endif
         F32 x = is_q ? p.q : p.k;
-        float a = x.v[2 * pg], b = x.v[2 * pg + 1];
+        float a = x.v[ia], b = x.v[ib];
         float ra = a * c - b * s, rb = a * s + b * c;
         if (is_q) {
-            x.v[2 * pg] = ra;
-            x.v[2 * pg + 1] = rb;
+            x.v[ia] = ra;
+            x.v[ib] = rb;
         } else {
-            uint at = p.pos0 * kvw + 2 * pg;
-            p.kc.v[at] = float16_t(ra);
-            p.kc.v[at + 1] = float16_t(rb);
+            uint at = p.pos0 * kvw;
+            p.kc.v[at + ia] = float16_t(ra);
+            p.kc.v[at + ib] = float16_t(rb);
         }
     } else if (g < qpairs + kpairs + kpairs) {
         uint pg = g - qpairs - kpairs;

@@ -65,6 +65,8 @@ poise = "=0.7.0"
 # Raw Vulkan for the GPU backend (gpu-plan.md), loaded at run time: no link-time
 # dependency on libvulkan, so CPU-only hosts still run.
 ash = { version = "=0.38.0", default-features = false, features = ["loaded", "std"] }
+# Untrusted images (classify::image): only these decoders, all pure Rust.
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 hf-hub = { version = "=0.4.3", default-features = false, features = ["ureq", "rustls-tls"] }
 
 # Novelty commands' fixed results (discord/seeded.rs): AES-256 under a configured key.

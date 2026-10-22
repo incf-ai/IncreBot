@@ -3527,6 +3527,7 @@ dependencies = [
  "gemm",
  "half",
  "hf-hub",
+ "image",
  "libc",
  "memmap2",
  "minijinja",

@@ -63,6 +63,8 @@ const SHADERS: &[(&str, &str, &[&str])] = &[
     ("quantize_q8k", "quantize_q8k.comp", &[]),
     ("rmsnorm", "rmsnorm.comp", &[]),
     ("rope_store", "rope_store.comp", &[]),
+    ("rope_store_neox", "rope_store.comp", &["-DNEOX"]),
+    ("short_conv", "short_conv.comp", &[]),
     ("swiglu", "swiglu.comp", &[]),
     ("flash_attn", "flash_attn.comp", &[]),
     ("attention_split", "attention_split.comp", &[]),

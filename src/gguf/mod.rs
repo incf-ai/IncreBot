@@ -44,7 +44,7 @@ impl GgmlType {
     }
 
     /// Bytes needed for `n` elements, or `None` for an unsupported type.
-    fn byte_size(self, n: u64) -> Option<u64> {
+    pub(crate) fn byte_size(self, n: u64) -> Option<u64> {
         match self {
             Self::F32 => Some(n * 4),
             Self::F16 => Some(n * 2),

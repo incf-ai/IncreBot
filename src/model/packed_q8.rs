@@ -211,7 +211,7 @@ impl PackedQ8Linear {
 /// row through `dequant_row(r, out)`: the rows are dequantized in parallel into
 /// the shared scratch buffer, then multiplied with f32 `gemm`. Long prefills of
 /// every packed format go through here.
-pub(super) fn dequant_matmul(
+pub(crate) fn dequant_matmul(
     x: &[f32],
     m: usize,
     n: usize,

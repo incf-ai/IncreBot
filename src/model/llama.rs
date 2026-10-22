@@ -102,15 +102,15 @@ pub enum LinearImpl {
 }
 
 /// `Dense` keeps every weight as f32; refuse it for anything but small models.
-const DENSE_MAX_PARAMS: u64 = 2_000_000_000;
+pub(crate) const DENSE_MAX_PARAMS: u64 = 2_000_000_000;
 
 /// Prefill runs in chunks of this many tokens, where `gemm` is efficient and the
 /// activations stay small (design.md §3).
-const PREFILL_CHUNK: usize = 512;
+pub(crate) const PREFILL_CHUNK: usize = 512;
 
 /// Prefills of at least this many tokens run on the wider prefill pool, if any
 /// (design.md §4). Below it the 22-thread pool measured no faster (`core_scaling`).
-const PREFILL_POOL_MIN_TOKENS: usize = 32;
+pub(crate) const PREFILL_POOL_MIN_TOKENS: usize = 32;
 
 /// The KV cache grows in steps of this many positions (design.md §5).
 const KV_CHUNK: usize = 256;
@@ -153,7 +153,7 @@ fn grow<T>(bufs: &mut [Vec<T>], have: usize, want: usize) {
 }
 
 impl KvCache {
-    fn new(layers: usize, kv_width: usize, f16: bool) -> Self {
+    pub(crate) fn new(layers: usize, kv_width: usize, f16: bool) -> Self {
         let store = if f16 {
             KvStore::F16 {
                 k: vec![Vec::new(); layers],
@@ -212,7 +212,7 @@ impl KvCache {
         }
     }
 
-    fn reserve(&mut self, positions: usize) {
+    pub(crate) fn reserve(&mut self, positions: usize) {
         let have = positions * self.kv_width;
         let want = positions.next_multiple_of(KV_CHUNK) * self.kv_width;
         match &mut self.store {
@@ -227,7 +227,7 @@ impl KvCache {
         }
     }
 
-    fn append(&mut self, layer: usize, k_new: &[f32], v_new: &[f32]) {
+    pub(crate) fn append(&mut self, layer: usize, k_new: &[f32], v_new: &[f32]) {
         match &mut self.store {
             KvStore::F32 { k, v } => {
                 k[layer].extend_from_slice(k_new);
@@ -240,7 +240,7 @@ impl KvCache {
         }
     }
 
-    fn attention(
+    pub(crate) fn attention(
         &self,
         layer: usize,
         q: &[f32],
@@ -371,47 +371,8 @@ impl Llama {
             );
         }
 
-        let linear = |name: &str| -> Result<Box<dyn QLinear>> {
-            let t = g.tensor(name)?;
-            let [out_f, in_f] = t.shape()[..] else {
-                bail!("tensor {name} is not 2-D")
-            };
-            if linear_impl == LinearImpl::Packed {
-                let bytes = g.bytes(t)?;
-                return Ok(match t.ty {
-                    GgmlType::Q8_0 => Box::new(PackedQ8Linear::new(bytes, in_f, out_f)),
-                    GgmlType::Q4K => Box::new(PackedKLinear::new(KQuant::Q4K, bytes, in_f, out_f)),
-                    GgmlType::Q6K => Box::new(PackedKLinear::new(KQuant::Q6K, bytes, in_f, out_f)),
-                    other => bail!("tensor {name} is {other:?}; packed needs Q8_0, Q4_K or Q6_K"),
-                });
-            }
-            if linear_impl == LinearImpl::Dense && t.ty != GgmlType::Q8_0 {
-                // K-quants have no Burn scheme; decode them straight to f32.
-                return Ok(Box::new(DenseLinear::from_f32(
-                    g.to_f32(t)?,
-                    out_f,
-                    in_f,
-                    device,
-                )));
-            }
-            let w = q8_0_tensor(g, t, device).with_context(|| format!("loading {name}"))?;
-            Ok(match linear_impl {
-                LinearImpl::Burn => Box::new(BurnQLinear::new(w)),
-                LinearImpl::Dense => Box::new(DenseLinear::from_quantized(w)),
-                // Packed already returned above; a bug there should fail this
-                // tensor's load, not panic the whole process.
-                LinearImpl::Packed => bail!("linear_impl::Packed reached the dense/burn branch"),
-            })
-        };
-        let vector = |name: &str, len: usize| -> Result<Vec<f32>> {
-            let v = g.to_f32(g.tensor(name)?)?;
-            ensure!(
-                v.len() == len,
-                "tensor {name} has {} elements, expected {len}",
-                v.len()
-            );
-            Ok(v)
-        };
+        let linear = |name: &str| load_linear(g, name, linear_impl, device);
+        let vector = |name: &str, len: usize| load_vector(g, name, len);
 
         let embd_info = g.tensor("token_embd.weight")?;
         let tok_embd = vector("token_embd.weight", config.vocab * config.d_model)?;
@@ -447,7 +408,7 @@ impl Llama {
             Err(e) => return Err(e),
         };
 
-        let (rope_cos, rope_sin) = rope_tables(&config);
+        let (rope_cos, rope_sin) = rope_tables(config.head_dim, config.rope_theta, config.n_ctx);
         info!(elapsed_s = start.elapsed().as_secs_f32(), "model loaded");
         Ok(Self {
             out_norm: vector("output_norm.weight", config.d_model)?,
@@ -623,16 +584,67 @@ impl Llama {
     }
 }
 
+/// Loads a 2-D weight into the [`QLinear`] `linear_impl` asks for.
+pub(crate) fn load_linear(
+    g: &Gguf,
+    name: &str,
+    linear_impl: LinearImpl,
+    device: &Device,
+) -> Result<Box<dyn QLinear>> {
+    let t = g.tensor(name)?;
+    let [out_f, in_f] = t.shape()[..] else {
+        bail!("tensor {name} is not 2-D")
+    };
+    if linear_impl == LinearImpl::Packed {
+        let bytes = g.bytes(t)?;
+        return Ok(match t.ty {
+            GgmlType::Q8_0 => Box::new(PackedQ8Linear::new(bytes, in_f, out_f)),
+            GgmlType::Q4K => Box::new(PackedKLinear::new(KQuant::Q4K, bytes, in_f, out_f)),
+            GgmlType::Q6K => Box::new(PackedKLinear::new(KQuant::Q6K, bytes, in_f, out_f)),
+            other => bail!("tensor {name} is {other:?}; packed needs Q8_0, Q4_K or Q6_K"),
+        });
+    }
+    if linear_impl == LinearImpl::Dense && t.ty != GgmlType::Q8_0 {
+        // K-quants have no Burn scheme; decode them straight to f32.
+        return Ok(Box::new(DenseLinear::from_f32(
+            g.to_f32(t)?,
+            out_f,
+            in_f,
+            device,
+        )));
+    }
+    let w = q8_0_tensor(g, t, device).with_context(|| format!("loading {name}"))?;
+    Ok(match linear_impl {
+        LinearImpl::Burn => Box::new(BurnQLinear::new(w)),
+        LinearImpl::Dense => Box::new(DenseLinear::from_quantized(w)),
+        // Packed already returned above; a bug there should fail this
+        // tensor's load, not panic the whole process.
+        LinearImpl::Packed => bail!("linear_impl::Packed reached the dense/burn branch"),
+    })
+}
+
+/// Loads a tensor of `len` elements as f32.
+pub(crate) fn load_vector(g: &Gguf, name: &str, len: usize) -> Result<Vec<f32>> {
+    let v = g.to_f32(g.tensor(name)?)?;
+    ensure!(
+        v.len() == len,
+        "tensor {name} has {} elements, expected {len}",
+        v.len()
+    );
+    Ok(v)
+}
+
 /// RoPE tables for the *interleaved* convention: element pair `(2i, 2i + 1)` is
 /// rotated by `pos · θ^(-2i / head_dim)`. GGUF `llama` weights need this one; HF's
 /// half-split `rotate_half` gives plausible garbage (design.md §5).
-fn rope_tables(c: &LlamaConfig) -> (Vec<f32>, Vec<f32>) {
-    let half = c.head_dim / 2;
-    let mut cos = Vec::with_capacity(c.n_ctx * half);
-    let mut sin = Vec::with_capacity(c.n_ctx * half);
-    for pos in 0..c.n_ctx {
+/// The same tables serve the half-split convention ([`kernels::rope_neox`]).
+pub(crate) fn rope_tables(head_dim: usize, theta: f32, n_ctx: usize) -> (Vec<f32>, Vec<f32>) {
+    let half = head_dim / 2;
+    let mut cos = Vec::with_capacity(n_ctx * half);
+    let mut sin = Vec::with_capacity(n_ctx * half);
+    for pos in 0..n_ctx {
         for i in 0..half {
-            let freq = (c.rope_theta as f64).powf(-2.0 * i as f64 / c.head_dim as f64);
+            let freq = (theta as f64).powf(-2.0 * i as f64 / head_dim as f64);
             let angle = pos as f64 * freq;
             cos.push(angle.cos() as f32);
             sin.push(angle.sin() as f32);
