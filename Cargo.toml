@@ -62,6 +62,9 @@ workspace = true
 burn = { version = "=0.22.0-pre.3", default-features = false, features = ["std", "flex"] }
 tokenizers = { version = "=0.23.2", default-features = false, features = ["onig"] }
 poise = "=0.7.0"
+# Components V2 replies with several files (discord/classify.rs reply_v2); the
+# version and TLS serenity already uses.
+reqwest = { version = "0.12", default-features = false, features = ["multipart"] }
 # Raw Vulkan for the GPU backend (gpu-plan.md), loaded at run time: no link-time
 # dependency on libvulkan, so CPU-only hosts still run.
 ash = { version = "=0.38.0", default-features = false, features = ["loaded", "std"] }

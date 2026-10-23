@@ -64,11 +64,17 @@ const SHADERS: &[(&str, &str, &[&str])] = &[
     ("rmsnorm", "rmsnorm.comp", &[]),
     ("rope_store", "rope_store.comp", &[]),
     ("rope_store_neox", "rope_store.comp", &["-DNEOX"]),
+    ("rope_store_neox_rows", "rope_store.comp", &["-DNEOX", "-DROWS"]),
+    ("add", "add.comp", &[]),
     ("short_conv", "short_conv.comp", &[]),
     ("swiglu", "swiglu.comp", &[]),
     ("flash_attn", "flash_attn.comp", &[]),
     ("attention_split", "attention_split.comp", &[]),
     ("attention_merge", "attention_merge.comp", &[]),
+    ("matmul_f16", "matmul_f16.comp", &[]),
+    ("layernorm", "layernorm.comp", &[]),
+    ("vit_rope", "vit_rope.comp", &[]),
+    ("vit_attn", "vit_attn.comp", &["-DHD=72"]),
 ];
 
 fn compile_shaders() {

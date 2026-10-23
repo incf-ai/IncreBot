@@ -13,21 +13,21 @@ use super::{Context, Error, NOTICE_PREFIX, notice};
 use crate::classify::image::ImageLimits;
 use crate::classify::{Classifier, Decision, Json, Question};
 
-/// The d1 classifier, one call at a time: each uses every compute thread (or
-/// the GPU) on its own.
-pub struct Classify {
-    pub classifier: Arc<Classifier>,
+/// A model used one call at a time: each uses every compute thread (or the
+/// GPU) on its own.
+pub struct Gated<M> {
+    pub model: Arc<M>,
     pub turn: tokio::sync::Semaphore,
 }
 
-impl Classify {
-    pub fn new(classifier: Classifier) -> Self {
-        Self {
-            classifier: Arc::new(classifier),
-            turn: tokio::sync::Semaphore::new(1),
-        }
+impl<M> Gated<M> {
+    pub fn new(model: M) -> Self {
+        Self { model: Arc::new(model), turn: tokio::sync::Semaphore::new(1) }
     }
 }
+
+/// The d1 classifier.
+pub type Classify = Gated<Classifier>;
 
 /// Ask d1 up to five yes/no questions about a text.
 #[poise::command(
@@ -70,7 +70,7 @@ pub async fn classify_text(
         return notice(ctx, format!("{NOTICE_PREFIX}needs both a text and a question)*")).await;
     }
     let limit = data.cfg.classify.classify_max_text_tokens;
-    let tokens = classify.classifier.tokenizer().encode(&text).map_or(usize::MAX, |t| t.len());
+    let tokens = classify.model.tokenizer().encode(&text).map_or(usize::MAX, |t| t.len());
     if tokens > limit {
         return notice(
             ctx,
@@ -131,7 +131,7 @@ pub async fn classify_image(
     question5: Option<String>,
 ) -> Result<(), Error> {
     let data = ctx.data().clone();
-    let Some(classify) = data.classify.clone().filter(|c| c.classifier.has_vision()) else {
+    let Some(classify) = data.classify.clone().filter(|c| c.model.has_vision()) else {
         return notice(ctx, format!("{NOTICE_PREFIX}picture classification is turned off here)*")).await;
     };
     if data.shutting_down.load(Ordering::Relaxed) {
@@ -143,7 +143,7 @@ pub async fn classify_image(
     }
     let k = &data.cfg.classify;
     let limits = ImageLimits {
-        max_bytes: k.max_image_bytes,
+        max_bytes: k.max_image_mib << 20,
         max_pixels: k.max_image_pixels,
         max_side: k.image_max_side,
     };
@@ -190,56 +190,110 @@ pub async fn classify_image(
     reply_with_picture(ctx, jpeg, &name, &answers(&questions, &yes)).await
 }
 
-/// The deferred response, edited into a Components V2 message (which serenity
-/// 0.12 has no builders for): the asker, the picture, then `answers`. A plain
-/// message shows attachments under its text, and an embed's picture can't be
-/// spoilered.
+/// The asker, the picture (spoilered), then `answers`, as one reply.
 async fn reply_with_picture(ctx: Context<'_>, jpeg: Vec<u8>, name: &str, answers: &str) -> Result<(), Error> {
+    let components = vec![text_display(&asker(ctx)), gallery(&[name]), text_display(answers)];
+    let file = serenity::CreateAttachment::bytes(jpeg, name);
+    let plain = poise::CreateReply::default()
+        .content(format!("{}\n{answers}", asker(ctx)))
+        .attachment(file.clone());
+    reply_v2(ctx, components, vec![file], plain).await
+}
+
+/// Components V2 (which serenity 0.12 has no builders for): a text display.
+pub(super) fn text_display(content: &str) -> serde_json::Value {
+    serde_json::json!({ "type": 10, "content": content })
+}
+
+/// Components V2: the attachments `names`, spoilered, as one media gallery
+/// (side by side, in order).
+pub(super) fn gallery(names: &[&str]) -> serde_json::Value {
+    let items: Vec<_> = names
+        .iter()
+        .map(|name| serde_json::json!({ "media": { "url": format!("attachment://{name}") }, "spoiler": true }))
+        .collect();
+    serde_json::json!({ "type": 12, "items": items })
+}
+
+/// Components V2: the attachment `name` as a file.
+pub(super) fn file(name: &str) -> serde_json::Value {
+    serde_json::json!({ "type": 13, "file": { "url": format!("attachment://{name}") } })
+}
+
+/// The deferred response, edited into a Components V2 message of `components`
+/// with `files` attached (a plain message shows attachments under its text, and
+/// an embed's picture can't be spoilered). If Discord refuses it, `plain` is
+/// sent instead: still one reply, with the files under the text.
+pub(super) async fn reply_v2(
+    ctx: Context<'_>,
+    components: Vec<serde_json::Value>,
+    files: Vec<serenity::CreateAttachment>,
+    plain: poise::CreateReply,
+) -> Result<(), Error> {
     let poise::Context::Application(app) = ctx else {
-        unreachable!("/classify-image is a slash command")
+        unreachable!("only slash commands reply this way")
     };
     const IS_COMPONENTS_V2: u64 = 1 << 15;
-    const TEXT_DISPLAY: u8 = 10;
-    const MEDIA_GALLERY: u8 = 12;
+    let attachments: Vec<_> = files
+        .iter()
+        .enumerate()
+        .map(|(id, f)| serde_json::json!({ "id": id, "filename": f.filename }))
+        .collect();
     let body = serde_json::json!({
         "flags": IS_COMPONENTS_V2,
         "allowed_mentions": { "parse": [] },
-        "attachments": [{ "id": 0, "filename": name }],
-        "components": [
-            { "type": TEXT_DISPLAY, "content": asker(ctx) },
-            { "type": MEDIA_GALLERY, "items": [
-                { "media": { "url": format!("attachment://{name}") }, "spoiler": true },
-            ] },
-            { "type": TEXT_DISPLAY, "content": answers },
-        ],
+        "attachments": attachments,
+        "components": components,
     });
-    let file = serenity::CreateAttachment::bytes(jpeg.clone(), name);
-    match ctx.http().edit_original_interaction_response(&app.interaction.token, &body, vec![file]).await {
-        Ok(_) => Ok(()),
+    // Each file is the part `files[id]` for its id above. Serenity 0.12 names
+    // every part `files[0]` here (the ids it would set are private to it), so
+    // two or more files were refused; this is its request, numbered.
+    let mut form = reqwest::multipart::Form::new().text("payload_json", body.to_string());
+    for (id, f) in files.into_iter().enumerate() {
+        let mime = if f.filename.ends_with(".txt") { "text/plain; charset=utf-8" } else { "image/jpeg" };
+        let part = reqwest::multipart::Part::bytes(f.data).file_name(f.filename).mime_str(mime)?;
+        form = form.part(format!("files[{id}]"), part);
+    }
+    // The interaction token is the credential; no bot token goes with it.
+    let url = format!(
+        "https://discord.com/api/v10/webhooks/{}/{}/messages/@original",
+        app.interaction.application_id, app.interaction.token
+    );
+    let sent = async {
+        let response = HTTP.patch(url).multipart(form).send().await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok::<(), Error>(());
+        }
+        Err(format!("{status}: {}", response.text().await.unwrap_or_default()).into())
+    };
+    match sent.await {
+        Ok(()) => Ok(()),
         Err(e) => {
-            // Still one reply, with the picture under the text.
-            warn!(error = %e, "classify-image Components V2 reply refused; sending it plainly");
-            let plain = poise::CreateReply::default()
-                .content(format!("{}\n{answers}", asker(ctx)))
-                .attachment(serenity::CreateAttachment::bytes(jpeg, name));
+            warn!(error = %e, command = %ctx.command().name, "Components V2 reply refused; sending it plainly");
             reply(ctx, plain).await
         }
     }
 }
 
-/// How long `/classify-image` may fetch and decode before it must defer
+/// For `reply_v2`'s requests: one connection pool, a timeout like serenity's.
+static HTTP: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
+    reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap_or_default()
+});
+
+/// How long a command may fetch and decode a picture before it must defer
 /// (Discord wants a response within 3 s).
-const FETCH_BEFORE_DEFER: std::time::Duration = std::time::Duration::from_secs(2);
+pub(super) const FETCH_BEFORE_DEFER: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The attachment downloaded into memory (it never touches the disk), decoded
 /// within `limits` and re-encoded as the JPEG to repost; or why not, worded
 /// for the sender.
-async fn fetch_picture(
+pub(super) async fn fetch_picture(
     picture: &serenity::Attachment,
     limits: ImageLimits,
 ) -> Result<(::image::RgbImage, Vec<u8>), String> {
     let bytes = picture.download().await.map_err(|e| {
-        warn!(error = %e, "classify-image download failed");
+        warn!(error = %e, "picture download failed");
         "couldn't fetch the picture".to_owned()
     })?;
     let decode = move || {
@@ -250,15 +304,14 @@ async fn fetch_picture(
     match tokio::task::spawn_blocking(decode).await {
         Ok(decoded) => decoded.map_err(|why| why.to_string()),
         Err(e) => {
-            warn!(error = %e, "classify-image decode task failed");
+            warn!(error = %e, "picture decode task failed");
             Err("the picture could not be read".to_owned())
         }
     }
 }
 
-/// Runs `run` on the classifier in its turn, off the async threads: P(yes) of
-/// each question, or `None` once the failure has been said (`hold`
-/// released). `size` (tokens, pixels) goes to the log.
+/// Runs `run` on the classifier in its turn: P(yes) of each question, or
+/// `None` once the failure has been said (`hold` released).
 async fn decide(
     ctx: Context<'_>,
     classify: &Classify,
@@ -267,26 +320,41 @@ async fn decide(
     size: usize,
     run: impl FnOnce(&Classifier) -> anyhow::Result<Vec<Decision>> + Send + 'static,
 ) -> Result<Option<Vec<f64>>, Error> {
+    let decisions = in_turn(ctx, classify, hold, what, size, run).await?;
+    Ok(decisions.map(|d| d.iter().map(|d| d.probabilities[0]).collect()))
+}
+
+/// Runs `run` on the model in its turn, off the async threads: its result, or
+/// `None` once the failure has been said (`hold` released). `size` (tokens,
+/// pixels) goes to the log.
+pub(super) async fn in_turn<M: Send + Sync + 'static, T: Send + 'static>(
+    ctx: Context<'_>,
+    gated: &Gated<M>,
+    hold: Option<super::limits::Hold>,
+    what: &'static str,
+    size: usize,
+    run: impl FnOnce(&M) -> anyhow::Result<T> + Send + 'static,
+) -> Result<Option<T>, Error> {
     let data = ctx.data();
     let result = {
-        let _turn = classify.turn.acquire().await?;
-        let classifier = classify.classifier.clone();
+        let _turn = gated.turn.acquire().await?;
+        let model = gated.model.clone();
         tokio::task::spawn_blocking(move || {
             let start = std::time::Instant::now();
-            let out = run(&classifier);
+            let out = run(&model);
             (out, start.elapsed())
         })
         .await
     };
     match result {
-        Ok((Ok(decisions), took)) => {
+        Ok((Ok(out), took)) => {
             info!(size, took_ms = took.as_millis() as u64, "{what}");
-            Ok(Some(decisions.iter().map(|d| d.probabilities[0]).collect()))
+            Ok(Some(out))
         }
         Ok((Err(e), _)) => {
             warn!(error = %e, "{what} failed");
             data.limit_release(hold);
-            ctx.say(format!("{NOTICE_PREFIX}classification failed)*")).await?;
+            ctx.say(format!("{NOTICE_PREFIX}{what} failed)*")).await?;
             Ok(None)
         }
         Err(e) => {
@@ -298,13 +366,13 @@ async fn decide(
 
 /// Sends `out` with every ping turned off: the asker's mention only names them,
 /// and nothing in a reposted text pings anyone.
-async fn reply(ctx: Context<'_>, out: poise::CreateReply) -> Result<(), Error> {
+pub(super) async fn reply(ctx: Context<'_>, out: poise::CreateReply) -> Result<(), Error> {
     ctx.send(out.allowed_mentions(serenity::CreateAllowedMentions::new())).await?;
     Ok(())
 }
 
 /// Discord's limit on a message's text.
-const MESSAGE_CHARS: usize = 2000;
+pub(super) const MESSAGE_CHARS: usize = 2000;
 
 /// Questions per call. At 300 characters each, all of them with their
 /// verdicts and the asker still fit in one message ([`MESSAGE_CHARS`]).
@@ -343,13 +411,13 @@ fn answers(questions: &[String], yes: &[f64]) -> String {
 }
 
 /// `text` as a block quote that ends with it: every line behind `> `.
-fn block_quote(text: &str) -> String {
+pub(super) fn block_quote(text: &str) -> String {
     text.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n")
 }
 
 /// The sender's file name without its extension, kept to safe characters
 /// (it becomes the reposted attachment's name).
-fn file_stem(name: &str) -> String {
+pub(super) fn file_stem(name: &str) -> String {
     let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
     let safe: String = stem
         .chars()
@@ -372,7 +440,7 @@ fn verdict(yes: f64) -> String {
     format!("{word} — P(yes) = {pct}%")
 }
 
-fn one_line(s: &str) -> String {
+pub(super) fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 

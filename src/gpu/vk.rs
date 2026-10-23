@@ -109,11 +109,17 @@ pub struct Pipelines {
     pub rmsnorm: vk::Pipeline,
     pub rope_store: vk::Pipeline,
     pub rope_store_neox: vk::Pipeline,
+    pub rope_store_neox_rows: vk::Pipeline,
+    pub add: vk::Pipeline,
     pub short_conv: vk::Pipeline,
     pub swiglu: vk::Pipeline,
     pub flash_attn: vk::Pipeline,
     pub attention_split: vk::Pipeline,
     pub attention_merge: vk::Pipeline,
+    pub matmul_f16: vk::Pipeline,
+    pub layernorm: vk::Pipeline,
+    pub vit_rope: vk::Pipeline,
+    pub vit_attn: vk::Pipeline,
 }
 
 macro_rules! spirv {
@@ -161,9 +167,23 @@ pub struct Device {
     mem_host: u32,
     pub(crate) layout: vk::PipelineLayout,
     pub(crate) pipes: Pipelines,
+    /// Shared by every [`Device`] opened on the card (see [`tracker_for`]).
     pub tracker: Arc<Tracker>,
     /// Nanoseconds per timestamp tick.
     timestamp_ns: f32,
+}
+
+/// The card's one [`Tracker`] in this process: a model pinned there (d1,
+/// Qwen3-VL) is ours to the card's VRAM monitor, not another program.
+fn tracker_for(pci: PciAddr) -> Arc<Tracker> {
+    static TRACKERS: Mutex<Vec<(PciAddr, Arc<Tracker>)>> = Mutex::new(Vec::new());
+    let mut all = TRACKERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, t)) = all.iter().find(|(p, _)| *p == pci) {
+        return t.clone();
+    }
+    let t = Arc::<Tracker>::default();
+    all.push((pci, t.clone()));
+    t
 }
 
 impl Device {
@@ -291,11 +311,17 @@ impl Device {
                 rmsnorm: pipe(spirv!("rmsnorm"))?,
                 rope_store: pipe(spirv!("rope_store"))?,
                 rope_store_neox: pipe(spirv!("rope_store_neox"))?,
+                rope_store_neox_rows: pipe(spirv!("rope_store_neox_rows"))?,
+                add: pipe(spirv!("add"))?,
                 short_conv: pipe(spirv!("short_conv"))?,
                 swiglu: pipe(spirv!("swiglu"))?,
                 flash_attn: pipe(spirv!("flash_attn"))?,
                 attention_split: pipe(spirv!("attention_split"))?,
                 attention_merge: pipe(spirv!("attention_merge"))?,
+                matmul_f16: pipe(spirv!("matmul_f16"))?,
+                layernorm: pipe(spirv!("layernorm"))?,
+                vit_rope: pipe(spirv!("vit_rope"))?,
+                vit_attn: pipe(spirv!("vit_attn"))?,
             };
             Ok(Arc::new(Self {
                 pci,
@@ -307,7 +333,7 @@ impl Device {
                 mem_host,
                 layout,
                 pipes,
-                tracker: Arc::default(),
+                tracker: tracker_for(pci),
                 timestamp_ns: props.limits.timestamp_period,
             }))
         }
@@ -361,11 +387,17 @@ impl Drop for Device {
                 p.rmsnorm,
                 p.rope_store,
                 p.rope_store_neox,
+                p.rope_store_neox_rows,
+                p.add,
                 p.short_conv,
                 p.swiglu,
                 p.flash_attn,
                 p.attention_split,
                 p.attention_merge,
+                p.matmul_f16,
+                p.layernorm,
+                p.vit_rope,
+                p.vit_attn,
             ] {
                 self.raw.destroy_pipeline(pipe, None);
             }
@@ -916,6 +948,13 @@ impl Drop for Commands {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_tracker_per_card() {
+        let (a, b): (PciAddr, PciAddr) = ("0000:7f:00.0".parse().unwrap(), "0000:7f:00.1".parse().unwrap());
+        assert!(Arc::ptr_eq(&tracker_for(a), &tracker_for(a)));
+        assert!(!Arc::ptr_eq(&tracker_for(a), &tracker_for(b)));
+    }
 
     #[test]
     fn pci_addresses_round_trip() {

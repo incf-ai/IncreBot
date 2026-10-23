@@ -4,6 +4,8 @@
 mod actions;
 mod batch;
 mod classify;
+mod describe;
+mod embed;
 mod dispatch;
 mod force;
 pub mod hotdog;
@@ -72,6 +74,9 @@ pub struct Shared {
     pub gpus: Option<Arc<crate::gpu::manager::Gpus>>,
     /// d1 for `/classify-text`, when `classify.classify_enabled`.
     pub classify: Option<Arc<classify::Classify>>,
+    pub embed: Option<Arc<embed::Embed>>,
+    /// Qwen3-VL for `/describe-image`, when `describe.describe_enabled`.
+    pub describe: Option<Arc<describe::Describe>>,
     /// Prefills the persona header ahead of replies (at startup and reload).
     pub seed: crate::engine::worker::SeedHandle,
     /// What the bot was up to in each quiet channel (`chat::idle`).
@@ -328,6 +333,8 @@ pub fn intents() -> GatewayIntents {
 /// Builds the shared state and the poise framework, and starts the dispatcher.
 /// The caller connects the client; the model is already loaded (design.md §6:
 /// the bot shows offline until it can answer).
+// Each optional model is its own argument, `None` when turned off.
+#[allow(clippy::too_many_arguments)]
 pub fn framework(
     cfg: Config,
     tok: Arc<Tokenizer>,
@@ -335,6 +342,8 @@ pub fn framework(
     engine: EngineHandle,
     optouts: OptOuts,
     classifier: Option<crate::classify::Classifier>,
+    embedder: Option<crate::embed::Embedder>,
+    describer: Option<crate::describe::Describer>,
 ) -> (poise::Framework<Data, Error>, Data) {
     let (dispatch_tx, dispatch_rx) = mpsc::unbounded_channel();
     let novelty_key = seeded::Key::new(cfg.discord.novelty_key);
@@ -353,6 +362,8 @@ pub fn framework(
         resets: engine.resets.clone(),
         gpus: engine.gpus.clone(),
         classify: classifier.map(|c| Arc::new(classify::Classify::new(c))),
+        embed: embedder.map(|e| Arc::new(embed::Embed::new(e))),
+        describe: describer.map(|d| Arc::new(describe::Describe::new(d))),
         seed: engine.seed.clone(),
         idle: Default::default(),
         started: Instant::now(),
@@ -405,6 +416,8 @@ pub fn framework(
                 delete_reply(),
                 classify::classify_text(),
                 classify::classify_image(),
+                embed::embed_compare(),
+                describe::describe_image(),
             ],
             // Any command but `/retry`, `/retry-batch`, `/undo-retry`, `/delete-reply`,
             // "Admin actions" and "Reply actions" counts
@@ -615,6 +628,11 @@ async fn on_event(
 
 async fn on_message(ctx: &serenity::Context, data: &Data, msg: &serenity::Message) {
     let bot_id = data.bot_id();
+    // An ephemeral notice (a refusal, "busy", "Retrying…") shows only to the
+    // one it answers: it isn't in the channel, so it blocks no `/retry`.
+    if msg.flags.is_some_and(|f| f.contains(serenity::MessageFlags::EPHEMERAL)) {
+        return;
+    }
     // `/retry` and `/delete-reply` bookkeeping: the bot's own post, or
     // anyone's message (`//` and opted-out ones block a delete too).
     data.retry().gateway_message(

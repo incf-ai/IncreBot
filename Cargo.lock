@@ -3535,6 +3535,7 @@ dependencies = [
  "proptest",
  "rand 0.9.5",
  "rayon",
+ "reqwest",
  "rsn",
  "serde",
  "serde_json",

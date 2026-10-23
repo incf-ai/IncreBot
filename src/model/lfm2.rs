@@ -124,15 +124,35 @@ pub(crate) struct Layer {
 
 /// The embedding table kept quantized; rows are decoded on lookup (the f32 table
 /// of a 128k vocabulary would be 1 GB).
-struct Embedding {
+pub(crate) struct Embedding {
     bytes: Vec<u8>,
     ty: GgmlType,
     row_bytes: usize,
-    width: usize,
+    pub(crate) width: usize,
 }
 
 impl Embedding {
-    fn row(&self, id: usize, out: &mut Vec<f32>) -> Result<()> {
+    /// `token_embd.weight`, `[vocab, d]`.
+    pub(crate) fn load(g: &Gguf, vocab: usize, d: usize) -> Result<Self> {
+        let info = g.tensor("token_embd.weight")?;
+        ensure!(
+            info.shape() == [vocab, d],
+            "token_embd.weight is {:?}, expected [{vocab}, {d}]",
+            info.shape()
+        );
+        let row_bytes = match info.ty {
+            GgmlType::Q8_0 => d / QK8_0 * crate::gguf::Q8_0_BLOCK_BYTES,
+            GgmlType::Q4K => d / QK_K * crate::gguf::Q4_K_BLOCK_BYTES,
+            GgmlType::Q6K => d / QK_K * crate::gguf::Q6_K_BLOCK_BYTES,
+            ty => ty
+                .byte_size(d as u64)
+                .with_context(|| format!("embedding type {ty:?} is not supported"))?
+                as usize,
+        };
+        Ok(Self { bytes: g.bytes(info)?.to_vec(), ty: info.ty, row_bytes, width: d })
+    }
+
+    pub(crate) fn row(&self, id: usize, out: &mut Vec<f32>) -> Result<()> {
         let b = &self.bytes[id * self.row_bytes..][..self.row_bytes];
         match self.ty {
             GgmlType::F32 => out.extend(b.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c))),
@@ -199,28 +219,7 @@ impl Lfm2 {
         let linear = |name: &str| load_linear(g, name, linear_impl, device);
         let vector = |name: &str, len: usize| load_vector(g, name, len);
 
-        let info = g.tensor("token_embd.weight")?;
-        ensure!(
-            info.shape() == [config.vocab, d],
-            "token_embd.weight is {:?}, expected [{}, {d}]",
-            info.shape(),
-            config.vocab
-        );
-        let row_bytes = match info.ty {
-            GgmlType::Q8_0 => d / QK8_0 * crate::gguf::Q8_0_BLOCK_BYTES,
-            GgmlType::Q4K => d / QK_K * crate::gguf::Q4_K_BLOCK_BYTES,
-            GgmlType::Q6K => d / QK_K * crate::gguf::Q6_K_BLOCK_BYTES,
-            ty => ty
-                .byte_size(d as u64)
-                .with_context(|| format!("embedding type {ty:?} is not supported"))?
-                as usize,
-        };
-        let embed = Embedding {
-            bytes: g.bytes(info)?.to_vec(),
-            ty: info.ty,
-            row_bytes,
-            width: d,
-        };
+        let embed = Embedding::load(g, config.vocab, d)?;
 
         let mut layers = Vec::with_capacity(config.n_layers);
         let mut slot = 0;

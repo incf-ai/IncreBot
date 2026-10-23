@@ -116,9 +116,37 @@ Config {
         classify_gpu:            "",     // PCI address to run d1 on, always (not managed like
                                          // runtime.gpus); "" = CPU (~0.7 s per question)
         classify_max_text_tokens: 1500,  // longer text is turned away
-        max_image_bytes:         8388608,   // larger attachments are turned away unread
+        max_image_mib:           10,        // larger attachments are turned away unread (MiB)
         max_image_pixels:        40000000,  // so are images with more pixels, judged from the header
         image_max_side:          640,    // images are scaled to at most this on the longer side
         max_audio_secs:          30,     // longer clips are turned away; d1 hears at most 30 s
+    },
+
+    // /embed-compare: cosine similarities between up to two pictures and two texts,
+    // by google/embeddinggemma-2 on the CPU (~2 s per picture, well under 1 s per text).
+    // Uses the same per-user limits as /ask, and classify's max_image_mib and max_image_pixels.
+    embed: Embed {
+        embed_enabled:         false,  // load EmbeddingGemma 2 (~1.5 GB) at startup and offer the command
+        embed_max_text_tokens: 2048,   // longer text is turned away; 2048 at most
+        embed_image_max_side:  1536,   // pictures are scaled to at most this before the model's own resize
+    },
+
+    // /describe-image: Qwen3-VL-8B-Instruct describes a picture or answers a question about it.
+    // Pinned to one GPU (~7 GB), vision tower included (~1 s for the largest picture).
+    // Uses the same per-user limits as /ask, and classify's max_image_mib and max_image_pixels.
+    describe: Describe {
+        describe_enabled:          false,  // load Qwen3-VL at startup and offer the command
+        describe_repo:             "Qwen/Qwen3-VL-8B-Instruct-GGUF",
+        describe_file:             "Qwen3VL-8B-Instruct-Q4_K_M.gguf",     // Q4_K_M is the only kind the GPU takes
+        describe_mmproj:           "mmproj-Qwen3VL-8B-Instruct-F16.gguf", // vision tower
+        describe_tokenizer_repo:   "Qwen/Qwen3-VL-8B-Instruct",
+        describe_gpu:              "",     // PCI address to pin it to, always (not managed like
+                                           // runtime.gpus); required when enabled
+        describe_max_new_tokens:   512,    // the answer's limit in tokens; 1..=2048
+        describe_max_image_tokens: 1024,   // pictures are scaled to at most this many tokens; 64..=4096
+        describe_max_prompt_chars: 1000,   // a longer question is turned away
+        describe_temperature:      0.7,    // the model card's sampling settings for pictures
+        describe_top_k:            20,
+        describe_top_p:            0.8,
     },
 }

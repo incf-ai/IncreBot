@@ -7,6 +7,8 @@
 #![allow(clippy::print_stderr)]
 
 mod d1;
+mod describe;
+mod embed;
 mod engine;
 mod gpu;
 mod gpu_sharing;

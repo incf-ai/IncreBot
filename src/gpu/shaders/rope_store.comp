@@ -2,7 +2,9 @@
 // RoPE on Q (in place) and K, and both K and V stored as f16 into the cache at
 // positions pos0.. . One invocation per pair: first Q's pairs, then K's (rotated
 // and stored), then V's (stored). Pairs are adjacent elements (2i, 2i + 1), or
-// with NEOX the two halves of each head (i, i + head_dim / 2).
+// with NEOX the two halves of each head (i, i + head_dim / 2). With ROWS the
+// cos/sin tables hold one row per token of this call rather than per position
+// (Qwen3-VL's multimodal positions, which aren't the cache slots).
 #include "common.glsl"
 
 layout(local_size_x = 256) in;
@@ -21,8 +23,13 @@ void main() {
         uint pg = is_q ? g : g - qpairs;
         uint per_row = (is_q ? p.heads : p.kv_heads) * half_;
         uint row = pg / per_row, i = pg % half_;
-        float c = p.cos_.v[(p.pos0 + row) * half_ + i];
-        float s = p.sin_.v[(p.pos0 + row) * half_ + i];
+#ifdef ROWS
+        uint at_ = row * half_ + i;
+#else
+        uint at_ = (p.pos0 + row) * half_ + i;
+#endif
+        float c = p.cos_.v[at_];
+        float s = p.sin_.v[at_];
 #ifdef NEOX
         uint ia = (pg / half_) * p.head_dim + i, ib = ia + half_;
 #else

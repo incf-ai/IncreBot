@@ -33,7 +33,7 @@ pub const CHUNK: usize = 512;
 pub(super) const MAX_KEYS: usize = 8192;
 
 /// Keys per workgroup in split decode attention (`attention_split.comp`).
-const SPLIT_KEYS: usize = 128;
+pub(super) const SPLIT_KEYS: usize = 128;
 
 /// Submissions in flight at once. Each is one layer, so a cancel waits for at
 /// most this many layers.

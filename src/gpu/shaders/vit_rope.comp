@@ -1,0 +1,26 @@
+#version 460
+// NeoX rotary embedding in place on the q and k thirds of a fused qkv row
+// (`[n, 3 · heads · hd]`), from the host's tables: `cos` then `sin`, each
+// `[n, hd / 2]`. One workgroup per row.
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    F32 qkv; F32 tab;
+    uint n; uint heads; uint hd;
+} p;
+
+void main() {
+    uint row = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x;
+    uint half_ = p.hd / 2, d = p.heads * p.hd;
+    uint base = row * 3 * d;
+    // q and k: 2 · heads · half pairs.
+    for (uint i = tid; i < 2 * p.heads * half_; i += 256) {
+        uint j = i % half_, head = i / half_;
+        float c = p.tab.v[row * half_ + j], s = p.tab.v[(p.n + row) * half_ + j];
+        uint a = base + head * p.hd + j;
+        float x0 = p.qkv.v[a], x1 = p.qkv.v[a + half_];
+        p.qkv.v[a] = x0 * c - x1 * s;
+        p.qkv.v[a + half_] = x1 * c + x0 * s;
+    }
+}

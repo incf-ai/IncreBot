@@ -30,12 +30,7 @@ pub enum Rejected {
 impl std::fmt::Display for Rejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TooLarge { bytes, max } => write!(
-                f,
-                "the file is {:.1} MB; the limit is {:.1} MB",
-                *bytes as f64 / 1e6,
-                *max as f64 / 1e6
-            ),
+            Self::TooLarge { bytes, max } => write!(f, "the file is {} MiB; the limit is {} MiB", mib(*bytes), mib(*max)),
             Self::TooManyPixels { width, height, max } => write!(
                 f,
                 "the picture is {width}×{height}; the limit is {:.0} megapixels",
@@ -48,6 +43,15 @@ impl std::fmt::Display for Rejected {
 }
 
 impl std::error::Error for Rejected {}
+
+/// `bytes` in MiB: whole when it is, else to a tenth (rounded up, so a file
+/// just over the limit never reads as equal to it).
+fn mib(bytes: u64) -> String {
+    if bytes.is_multiple_of(1 << 20) {
+        return (bytes >> 20).to_string();
+    }
+    format!("{:.1}", (bytes as f64 / f64::from(1 << 20) * 10.0).ceil() / 10.0)
+}
 
 /// Decodes `bytes` within `limits` and scales the result (see the module doc).
 pub fn load(bytes: &[u8], limits: &ImageLimits) -> Result<RgbImage, Rejected> {
@@ -152,7 +156,10 @@ mod tests {
     #[test]
     fn turns_away_large_files_other_formats_and_garbage() {
         let big = vec![0u8; (LIMITS.max_bytes + 1) as usize];
-        assert!(matches!(load(&big, &LIMITS), Err(Rejected::TooLarge { .. })));
+        let err = load(&big, &LIMITS).unwrap_err();
+        assert_eq!(err.to_string(), "the file is 1.1 MiB; the limit is 1 MiB");
+        let err = Rejected::TooLarge { bytes: 12_345_678, max: 10 << 20 };
+        assert_eq!(err.to_string(), "the file is 11.8 MiB; the limit is 10 MiB");
         assert_eq!(load(b"GIF89a\x01\x00\x01\x00", &LIMITS), Err(Rejected::Format));
         assert_eq!(load(b"<svg xmlns='http://www.w3.org/2000/svg'/>", &LIMITS), Err(Rejected::Format));
         let mut png = encode(&DynamicImage::ImageRgb8(RgbImage::new(50, 50)), ImageFormat::Png);

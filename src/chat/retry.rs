@@ -5,7 +5,8 @@
 //! A retry is refused unless, in that channel:
 //! 1. it is the newest output, and no message of the bot's is newer than its
 //!    first finish but its own (a `/shake` message, a card left alone, a
-//!    message of a reply that left no output; a deleted one doesn't count);
+//!    message of a reply that left no output; a deleted or ephemeral one
+//!    doesn't count);
 //! 2. at most `max_newer` messages came after it that the bot can see (in
 //!    context: not `//`, not opted-out users'; deleted, edited into `//` or
 //!    opted out since, one no longer counts),

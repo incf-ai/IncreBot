@@ -1,0 +1,80 @@
+#version 460
+// Attention over every row (not causal) for the vision tower, from the fused
+// qkv rows (`[n, 3 · heads · HD]`, rotated) to `[n, heads · HD]`. One
+// invocation per query, 64 queries of one head per workgroup (grid
+// [ceil(n / 64), heads]); keys and values pass through shared memory in tiles
+// of 64, with an online softmax over chunks of 16 scores.
+#include "common.glsl"
+
+#ifndef HD
+#define HD 72
+#endif
+#define HD4 (HD / 4)
+#define QT 64
+#define KT 64
+#define CH 16
+
+layout(local_size_x = QT) in;
+layout(push_constant) uniform P {
+    V4 qkv; V4 y;
+    uint n; uint heads; float scale;
+} p;
+
+shared vec4 ks[KT][HD4];
+shared vec4 vs[KT][HD4];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint head = gl_WorkGroupID.y;
+    uint d4 = p.heads * HD4;
+    uint qi = gl_WorkGroupID.x * QT + tid;
+    bool live = qi < p.n;
+
+    vec4 q[HD4], acc[HD4];
+    for (uint i = 0; i < HD4; i++) {
+        q[i] = live ? p.qkv.v[qi * 3 * d4 + head * HD4 + i] * p.scale : vec4(0.0);
+        acc[i] = vec4(0.0);
+    }
+    float m = -1e30, l = 0.0;
+
+    for (uint k0 = 0; k0 < p.n; k0 += KT) {
+        for (uint e = tid; e < KT * HD4; e += QT) {
+            uint r = e / HD4, c = e % HD4;
+            uint key = k0 + r;
+            vec4 kv = vec4(0.0), vv = vec4(0.0);
+            if (key < p.n) {
+                kv = p.qkv.v[key * 3 * d4 + d4 + head * HD4 + c];
+                vv = p.qkv.v[key * 3 * d4 + 2 * d4 + head * HD4 + c];
+            }
+            ks[r][c] = kv;
+            vs[r][c] = vv;
+        }
+        barrier();
+        uint keys = min(KT, p.n - k0);
+        for (uint c0 = 0; c0 < keys; c0 += CH) {
+            float s[CH];
+            float cm = m;
+            for (uint j = 0; j < CH; j++) {
+                float dot_ = 0.0;
+                for (uint i = 0; i < HD4; i++) dot_ += dot(q[i], ks[c0 + j][i]);
+                s[j] = c0 + j < keys ? dot_ : -1e30;
+                cm = max(cm, s[j]);
+            }
+            float r = exp(m - cm);
+            l *= r;
+            for (uint i = 0; i < HD4; i++) acc[i] *= r;
+            m = cm;
+            for (uint j = 0; j < CH; j++) {
+                float e = exp(s[j] - m);
+                l += e;
+                for (uint i = 0; i < HD4; i++) acc[i] += e * vs[c0 + j][i];
+            }
+        }
+        barrier();
+    }
+
+    if (live) {
+        float inv = 1.0 / l;
+        for (uint i = 0; i < HD4; i++) p.y.v[qi * d4 + head * HD4 + i] = acc[i] * inv;
+    }
+}

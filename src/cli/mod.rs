@@ -2,6 +2,8 @@
 //! the arguments and calls [`run`]; the commands live here.
 
 mod classify;
+mod describe;
+mod embed;
 mod generate;
 mod inspect;
 mod serve;
@@ -15,6 +17,8 @@ use crate::hub;
 use crate::model::LinearImpl;
 
 pub use classify::ClassifyArgs;
+pub use describe::DescribeArgs;
+pub use embed::EmbedArgs;
 pub use generate::GenerateArgs;
 
 const DEFAULT_REPO: &str = "TheBloke/LLaMA2-13B-Tiefighter-GGUF";
@@ -52,6 +56,10 @@ enum Cmd {
     Generate(GenerateArgs),
     /// Answer System One questions about a state with a d1 model.
     Classify(ClassifyArgs),
+    /// Compare pictures and texts with EmbeddingGemma 2 (cosine similarities).
+    Embed(EmbedArgs),
+    /// Describe a picture, or answer a question about it, with Qwen3-VL-8B on a GPU.
+    Describe(DescribeArgs),
 }
 
 /// Which GGUF file to use.
@@ -109,6 +117,8 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Inspect { model, all } => inspect::inspect(&model, all),
         Cmd::Generate(args) => generate::generate(args),
         Cmd::Classify(args) => classify::classify(args),
+        Cmd::Embed(args) => embed::embed(args),
+        Cmd::Describe(args) => describe::describe(args),
     }
 }
 
@@ -134,6 +144,10 @@ mod tests {
         assert!(matches!(cli.cmd, Cmd::Generate(_)));
         let cli = Cli::try_parse_from(["increbot", "classify", "{}", "--state", "hi"]).unwrap();
         assert!(matches!(cli.cmd, Cmd::Classify(_)));
+        let cli = Cli::try_parse_from(["increbot", "embed", "--image", "a.png", "--text", "a", "--text", "b"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Embed(_)));
+        let cli = Cli::try_parse_from(["increbot", "describe", "a.png", "what is it?", "--gpu", "0000:03:00.0"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Describe(_)));
     }
 
     #[test]

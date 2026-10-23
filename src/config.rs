@@ -49,6 +49,8 @@ pub struct Config {
     pub generation: GenerationConfig,
     pub discord: DiscordConfig,
     pub classify: ClassifyConfig,
+    pub embed: EmbedConfig,
+    pub describe: DescribeConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -636,8 +638,9 @@ pub struct ClassifyConfig {
     pub classify_gpu: String,
     /// `/classify-text` turns away text longer than this, in d1 tokens.
     pub classify_max_text_tokens: usize,
-    /// `/classify-image` turns away attachments larger than this.
-    pub max_image_bytes: u64,
+    /// `/classify-image`, `/embed-compare` and `/describe-image` turn away
+    /// attachments larger than this, in MiB.
+    pub max_image_mib: u64,
     /// ... or with more pixels than this, judged from the header before decoding.
     pub max_image_pixels: u64,
     /// Images are scaled so their longer side is at most this.
@@ -656,10 +659,92 @@ impl Default for ClassifyConfig {
             classify_tokenizer_repo: crate::classify::TOKENIZER_REPO.into(),
             classify_gpu: String::new(),
             classify_max_text_tokens: 1500,
-            max_image_bytes: 8 << 20,
+            max_image_mib: 10,
             max_image_pixels: 40_000_000,
             image_max_side: 640,
             max_audio_secs: 30,
+        }
+    }
+}
+
+/// EmbeddingGemma 2 behind `/embed-compare`, on the CPU. Attachments are held
+/// to `classify.max_image_mib` and `classify.max_image_pixels`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename = "Embed")]
+pub struct EmbedConfig {
+    /// Load EmbeddingGemma 2 at startup and offer /embed-compare.
+    pub embed_enabled: bool,
+    /// `/embed-compare` turns away text longer than this, in Gemma tokens.
+    pub embed_max_text_tokens: usize,
+    /// Pictures are scaled so their longer side is at most this before the
+    /// model's own resize (to about 2520 patches of 16 × 16).
+    pub embed_image_max_side: u32,
+}
+
+impl Default for EmbedConfig {
+    fn default() -> Self {
+        Self {
+            embed_enabled: false,
+            embed_max_text_tokens: crate::embed::MAX_TEXT_TOKENS,
+            embed_image_max_side: 1536,
+        }
+    }
+}
+
+/// Qwen3-VL-8B-Instruct behind `/describe-image`, on `describe_gpu`. Attachments are held to
+/// `classify.max_image_mib` and `classify.max_image_pixels`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename = "Describe")]
+pub struct DescribeConfig {
+    /// Load Qwen3-VL at startup and offer /describe-image.
+    pub describe_enabled: bool,
+    pub describe_repo: String,
+    /// Q4_K_M (Q4_K and Q6_K blocks): the only kind the GPU takes.
+    pub describe_file: String,
+    pub describe_mmproj: String,
+    pub describe_tokenizer_repo: String,
+    /// Run the language model on the GPU at this PCI address, always (not
+    /// managed like `runtime.gpus`). Required when enabled.
+    pub describe_gpu: String,
+    /// The answer's limit in tokens.
+    pub describe_max_new_tokens: usize,
+    /// The picture's limit in language-model tokens (32 × 32 pixels each).
+    pub describe_max_image_tokens: usize,
+    /// `/describe-image` turns away a question longer than this.
+    pub describe_max_prompt_chars: usize,
+    /// Sampling; temperature 0 is greedy.
+    pub describe_temperature: f32,
+    pub describe_top_k: usize,
+    pub describe_top_p: f32,
+}
+
+impl Default for DescribeConfig {
+    fn default() -> Self {
+        let p = crate::describe::Params::default();
+        Self {
+            describe_enabled: false,
+            describe_repo: crate::describe::REPO.into(),
+            describe_file: crate::describe::MODEL_FILE.into(),
+            describe_mmproj: crate::describe::MMPROJ_FILE.into(),
+            describe_tokenizer_repo: crate::describe::TOKENIZER_REPO.into(),
+            describe_gpu: String::new(),
+            describe_max_new_tokens: p.max_new_tokens,
+            describe_max_image_tokens: crate::describe::MAX_IMAGE_TOKENS,
+            describe_max_prompt_chars: 1000,
+            describe_temperature: p.temperature,
+            describe_top_k: p.top_k,
+            describe_top_p: p.top_p,
+        }
+    }
+}
+
+impl DescribeConfig {
+    pub fn params(&self) -> crate::describe::Params {
+        crate::describe::Params {
+            max_new_tokens: self.describe_max_new_tokens,
+            temperature: self.describe_temperature,
+            top_k: self.describe_top_k,
+            top_p: self.describe_top_p,
         }
     }
 }
@@ -795,14 +880,56 @@ impl Config {
             k.classify_max_text_tokens
         );
         ensure!(
-            k.max_image_bytes >= 1 && k.max_image_pixels >= 1 && k.classify_max_text_tokens >= 1,
-            "max_image_bytes, max_image_pixels and classify_max_text_tokens must be at least 1"
+            k.max_image_mib >= 1 && k.max_image_pixels >= 1 && k.classify_max_text_tokens >= 1,
+            "max_image_mib, max_image_pixels and classify_max_text_tokens must be at least 1"
         );
         if !k.classify_gpu.is_empty() {
             k.classify_gpu
                 .parse::<crate::gpu::PciAddr>()
                 .with_context(|| format!("classify_gpu {:?}", k.classify_gpu))?;
         }
+        let e = &self.embed;
+        ensure!(
+            (1..=crate::embed::MAX_TEXT_TOKENS).contains(&e.embed_max_text_tokens),
+            "embed_max_text_tokens must be 1..={}, got {}",
+            crate::embed::MAX_TEXT_TOKENS,
+            e.embed_max_text_tokens
+        );
+        ensure!(
+            (64..=4096).contains(&e.embed_image_max_side),
+            "embed_image_max_side must be 64..=4096, got {}",
+            e.embed_image_max_side
+        );
+        let q = &self.describe;
+        if q.describe_enabled {
+            ensure!(!q.describe_gpu.is_empty(), "describe_gpu must be set: /describe-image runs on a GPU only");
+        }
+        if !q.describe_gpu.is_empty() {
+            q.describe_gpu
+                .parse::<crate::gpu::PciAddr>()
+                .with_context(|| format!("describe_gpu {:?}", q.describe_gpu))?;
+        }
+        ensure!(
+            (1..=2048).contains(&q.describe_max_new_tokens),
+            "describe_max_new_tokens must be 1..=2048, got {}",
+            q.describe_max_new_tokens
+        );
+        ensure!(
+            (64..=4096).contains(&q.describe_max_image_tokens),
+            "describe_max_image_tokens must be 64..=4096, got {}",
+            q.describe_max_image_tokens
+        );
+        ensure!(
+            (1..=4000).contains(&q.describe_max_prompt_chars),
+            "describe_max_prompt_chars must be 1..=4000, got {}",
+            q.describe_max_prompt_chars
+        );
+        ensure!(
+            (0.0..=2.0).contains(&q.describe_temperature) && q.describe_top_p > 0.0 && q.describe_top_p <= 1.0,
+            "describe_temperature must be 0..=2 and describe_top_p in (0, 1], got {} and {}",
+            q.describe_temperature,
+            q.describe_top_p
+        );
         let d = &self.discord;
         if let Some(c) = d.dedicated_channels.iter().find(|c| listed(&d.shared_channels, c.id)) {
             bail!("channel {c} is in both dedicated_channels and shared_channels");

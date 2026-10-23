@@ -75,6 +75,8 @@ pub fn serve(config_path: &Path) -> Result<()> {
         Gpus::start(cfg.runtime.gpu_settings(cfg.model.n_ctx)?, model.clone())
     };
     let classifier = if cfg.classify.classify_enabled { Some(load_classifier(&cfg)?) } else { None };
+    let embedder = if cfg.embed.embed_enabled { Some(load_embedder()?) } else { None };
+    let describer = if cfg.describe.describe_enabled { Some(load_describer(&cfg)?) } else { None };
     let backends = Backends::new(model, gpus, cfg.model.n_ctx);
     let engine = crate::engine::worker::spawn(backends, tok.clone(), cfg.runtime.kv_cache_slots)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -83,7 +85,7 @@ pub fn serve(config_path: &Path) -> Result<()> {
         .build()?;
     rt.block_on(async move {
         use poise::serenity_prelude as serenity;
-        let (framework, shared) = discord::framework(cfg, tok, persona, engine, optouts, classifier);
+        let (framework, shared) = discord::framework(cfg, tok, persona, engine, optouts, classifier, embedder, describer);
         let mut client = serenity::ClientBuilder::new(token.trim(), discord::intents())
             .framework(framework)
             .await
@@ -118,6 +120,46 @@ fn load_classifier(cfg: &Config) -> Result<crate::classify::Classifier> {
     anyhow::ensure!(yes.is_finite() && yes > 0.5, "classifier self-test: P(yes) = {yes} for a greeting");
     info!(file = %k.classify_file, gpu = %k.classify_gpu, p_yes = yes, "classifier ready");
     Ok(classifier)
+}
+
+/// EmbeddingGemma 2 for /embed-compare (`embed` config section), checked on
+/// three texts before the bot goes online.
+fn load_embedder() -> Result<crate::embed::Embedder> {
+    use crate::embed::{Embedder, cosine};
+    let embedder = Embedder::load().context("loading EmbeddingGemma 2")?;
+    let [cat, chat, tax] = ["A cat sleeping on a sofa", "Le chat dort sur le canapé.", "quarterly tax filing deadlines"]
+        .map(|t| embedder.embed_text(t));
+    let (cat, chat, tax) = (cat?, chat?, tax?);
+    let (same, other) = (cosine(&cat, &chat), cosine(&cat, &tax));
+    anyhow::ensure!(
+        same > other + 0.1,
+        "embedder self-test: a translation scores {same}, an unrelated text {other}"
+    );
+    info!(same, other, "embedder ready");
+    Ok(embedder)
+}
+
+/// Qwen3-VL for /describe-image (`describe` config section), pinned to its
+/// GPU and checked on a plain red picture before the bot goes online.
+fn load_describer(cfg: &Config) -> Result<crate::describe::Describer> {
+    use crate::classify::vision::Rgb;
+    use crate::describe::Describer;
+    let k = &cfg.describe;
+    let dev = crate::gpu::Device::open(k.describe_gpu.parse()?).context("describe_gpu")?;
+    let describer = Describer::open(
+        &dev,
+        &hub::resolve(&k.describe_repo, &k.describe_file)?,
+        &hub::resolve(&k.describe_repo, &k.describe_mmproj)?,
+        &hub::resolve(&k.describe_tokenizer_repo, "tokenizer.json")?,
+        k.describe_max_image_tokens,
+        k.params(),
+    )
+    .context("loading Qwen3-VL")?;
+    let red = Rgb::new(64, 64, [220, 20, 20].repeat(64 * 64))?;
+    let d = describer.describe(&red, "What colour is this picture? Answer with one word.", &|| false)?;
+    anyhow::ensure!(d.text.to_lowercase().contains("red"), "describer self-test: a red picture is {:?}", d.text);
+    info!(gpu = %k.describe_gpu, answer = %d.text, secs = d.vision_secs + d.prefill_secs + d.decode_secs, "describer ready");
+    Ok(describer)
 }
 
 /// SIGHUP reloads the persona; SIGTERM/SIGINT shut down within ~5 s (design.md

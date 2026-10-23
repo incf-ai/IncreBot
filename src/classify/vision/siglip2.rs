@@ -19,7 +19,7 @@ use crate::model::packed_q8::dequant_matmul;
 use crate::model::{PackedQ8Linear, QLinear};
 
 /// A weight `[out, in]` with its bias.
-struct Linear {
+pub(crate) struct Linear {
     weight: Weight,
     bias: Vec<f32>,
     /// Keeps the activations f32 on a Q8 weight instead of quantizing them to
@@ -36,7 +36,7 @@ enum Weight {
 }
 
 impl Linear {
-    fn load(g: &Gguf, name: &str) -> Result<Self> {
+    pub(crate) fn load(g: &Gguf, name: &str) -> Result<Self> {
         let info = g.tensor(&format!("{name}.weight"))?;
         let shape = info.shape();
         ensure!(shape.len() == 2, "{name}: shape {shape:?}");
@@ -51,12 +51,35 @@ impl Linear {
         Ok(Self { weight, bias, exact: false })
     }
 
-    fn out_features(&self) -> usize {
+    /// From f32 rows `[out_features, in_features]`.
+    pub(crate) fn from_f32(values: Vec<f32>, in_features: usize, bias: Vec<f32>) -> Self {
+        let out_features = bias.len();
+        assert_eq!(values.len(), in_features * out_features, "weight size");
+        Self { weight: Weight::F32 { values, in_features, out_features }, bias, exact: false }
+    }
+
+    pub(crate) fn out_features(&self) -> usize {
         self.bias.len()
     }
 
+    pub(crate) fn bias(&self) -> &[f32] {
+        &self.bias
+    }
+
+    /// The weight as little-endian f16 rows `[out, in]`, for the GPU; `None`
+    /// for Q8_0.
+    pub(crate) fn f16_bytes(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
+        match &self.weight {
+            Weight::Q8(_) => None,
+            Weight::F16 { bytes, .. } => Some(bytes.into()),
+            Weight::F32 { values, .. } => {
+                Some(values.iter().flat_map(|v| half::f16::from_f32(*v).to_le_bytes()).collect::<Vec<u8>>().into())
+            }
+        }
+    }
+
     /// `x W^T + b` for the `m` rows of `x`.
-    fn forward(&self, x: &[f32], m: usize) -> Vec<f32> {
+    pub(crate) fn forward(&self, x: &[f32], m: usize) -> Vec<f32> {
         let mut y = match &self.weight {
             Weight::Q8(w) if self.exact => w.matmul(x, m),
             Weight::Q8(w) => w.forward(x, m),
@@ -82,20 +105,28 @@ impl Linear {
     }
 }
 
-struct LayerNorm {
+pub(crate) struct LayerNorm {
     weight: Vec<f32>,
     bias: Vec<f32>,
 }
 
 impl LayerNorm {
-    fn load(g: &Gguf, name: &str) -> Result<Self> {
+    pub(crate) fn weight(&self) -> &[f32] {
+        &self.weight
+    }
+
+    pub(crate) fn bias(&self) -> &[f32] {
+        &self.bias
+    }
+
+    pub(crate) fn load(g: &Gguf, name: &str) -> Result<Self> {
         Ok(Self {
             weight: g.to_f32(g.tensor(&format!("{name}.weight"))?)?,
             bias: g.to_f32(g.tensor(&format!("{name}.bias"))?)?,
         })
     }
 
-    fn forward(&self, x: &[f32], eps: f32) -> Vec<f32> {
+    pub(crate) fn forward(&self, x: &[f32], eps: f32) -> Vec<f32> {
         let d = self.weight.len();
         let mut out = vec![0f32; x.len()];
         out.par_chunks_mut(d).zip(x.par_chunks(d)).for_each(|(o, x)| {
@@ -217,7 +248,7 @@ impl Vision {
         let l = &self.layers[i];
         let h = l.ln1.forward(x, self.eps);
         let (q, k, v) = (l.q.forward(&h, n), l.k.forward(&h, n), l.v.forward(&h, n));
-        let a = self.attention(&q, &k, &v, n);
+        let a = attention(&q, &k, &v, n, self.width, self.heads);
         add(x, &l.out.forward(&a, n));
         let h = l.ln2.forward(x, self.eps);
         let mut u = l.up.forward(&h, n);
@@ -299,65 +330,65 @@ impl Vision {
         out
     }
 
-    /// Bidirectional multi-head attention over all `n` rows: per head
-    /// `softmax(Q Kᵀ / √dh) V`, heads in parallel.
-    fn attention(&self, q: &[f32], k: &[f32], v: &[f32], n: usize) -> Vec<f32> {
-        let (d, heads) = (self.width, self.heads);
-        let dh = d / heads;
-        let scale = 1.0 / (dh as f32).sqrt();
-        let per_head: Vec<Vec<f32>> = (0..heads)
-            .into_par_iter()
-            .map(|h| {
-                let mut s = vec![0f32; n * n];
-                // SAFETY: q and k are n × d row-major; head h's columns are h·dh..(h+1)·dh, so
-                // Q_h has row stride d and K_hᵀ (dh × n) has element (kk, j) at j·d + kk. s is n × n.
-                unsafe {
-                    gemm::gemm(
-                        n, n, dh,
-                        s.as_mut_ptr(), 1, n as isize, false,
-                        q.as_ptr().add(h * dh), 1, d as isize,
-                        k.as_ptr().add(h * dh), d as isize, 1,
-                        0.0, scale, false, false, false,
-                        gemm::Parallelism::None,
-                    );
-                }
-                for row in s.chunks_exact_mut(n) {
-                    let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    let mut sum = 0f32;
-                    for v in row.iter_mut() {
-                        *v = (*v - m).exp();
-                        sum += *v;
-                    }
-                    let inv = 1.0 / sum;
-                    row.iter_mut().for_each(|v| *v *= inv);
-                }
-                let mut o = vec![0f32; n * dh];
-                // SAFETY: s is n × n row-major; V_h (n × dh) has element (j, c) at j·d + c; o is
-                // n × dh row-major.
-                unsafe {
-                    gemm::gemm(
-                        n, dh, n,
-                        o.as_mut_ptr(), 1, dh as isize, false,
-                        s.as_ptr(), 1, n as isize,
-                        v.as_ptr().add(h * dh), 1, d as isize,
-                        0.0, 1.0, false, false, false,
-                        gemm::Parallelism::None,
-                    );
-                }
-                o
-            })
-            .collect();
-        let mut out = vec![0f32; n * d];
-        out.par_chunks_mut(d).enumerate().for_each(|(r, row)| {
-            for (h, o) in per_head.iter().enumerate() {
-                row[h * dh..(h + 1) * dh].copy_from_slice(&o[r * dh..(r + 1) * dh]);
-            }
-        });
-        out
-    }
 }
 
-fn linear_in(l: &Linear) -> usize {
+/// Bidirectional multi-head attention over all `n` rows: per head
+/// `softmax(Q Kᵀ / √dh) V`, heads in parallel.
+pub(crate) fn attention(q: &[f32], k: &[f32], v: &[f32], n: usize, d: usize, heads: usize) -> Vec<f32> {
+    let dh = d / heads;
+    let scale = 1.0 / (dh as f32).sqrt();
+    let per_head: Vec<Vec<f32>> = (0..heads)
+        .into_par_iter()
+        .map(|h| {
+            let mut s = vec![0f32; n * n];
+            // SAFETY: q and k are n × d row-major; head h's columns are h·dh..(h+1)·dh, so
+            // Q_h has row stride d and K_hᵀ (dh × n) has element (kk, j) at j·d + kk. s is n × n.
+            unsafe {
+                gemm::gemm(
+                    n, n, dh,
+                    s.as_mut_ptr(), 1, n as isize, false,
+                    q.as_ptr().add(h * dh), 1, d as isize,
+                    k.as_ptr().add(h * dh), d as isize, 1,
+                    0.0, scale, false, false, false,
+                    gemm::Parallelism::None,
+                );
+            }
+            for row in s.chunks_exact_mut(n) {
+                let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0f32;
+                for v in row.iter_mut() {
+                    *v = (*v - m).exp();
+                    sum += *v;
+                }
+                let inv = 1.0 / sum;
+                row.iter_mut().for_each(|v| *v *= inv);
+            }
+            let mut o = vec![0f32; n * dh];
+            // SAFETY: s is n × n row-major; V_h (n × dh) has element (j, c) at j·d + c; o is
+            // n × dh row-major.
+            unsafe {
+                gemm::gemm(
+                    n, dh, n,
+                    o.as_mut_ptr(), 1, dh as isize, false,
+                    s.as_ptr(), 1, n as isize,
+                    v.as_ptr().add(h * dh), 1, d as isize,
+                    0.0, 1.0, false, false, false,
+                    gemm::Parallelism::None,
+                );
+            }
+            o
+        })
+        .collect();
+    let mut out = vec![0f32; n * d];
+    out.par_chunks_mut(d).enumerate().for_each(|(r, row)| {
+        for (h, o) in per_head.iter().enumerate() {
+            row[h * dh..(h + 1) * dh].copy_from_slice(&o[r * dh..(r + 1) * dh]);
+        }
+    });
+    out
+}
+
+pub(crate) fn linear_in(l: &Linear) -> usize {
     match &l.weight {
         Weight::Q8(w) => w.in_features(),
         Weight::F16 { in_features, .. } | Weight::F32 { in_features, .. } => *in_features,
@@ -390,7 +421,7 @@ fn patch_embedding(g: &Gguf, width: usize, patch: usize) -> Result<Linear> {
     })
 }
 
-fn add(x: &mut [f32], y: &[f32]) {
+pub(crate) fn add(x: &mut [f32], y: &[f32]) {
     x.par_iter_mut().zip(y).for_each(|(a, b)| *a += b);
 }
 
@@ -415,13 +446,13 @@ fn aa_weights(input: usize, output: usize) -> Vec<(usize, Vec<f32>)> {
 }
 
 /// `gelu_pytorch_tanh`.
-fn gelu_tanh(x: f32) -> f32 {
+pub(crate) fn gelu_tanh(x: f32) -> f32 {
     let u = 0.797_884_6 * (x + 0.044_715 * x * x * x);
     x / (1.0 + (-2.0 * u).exp())
 }
 
 /// The exact GELU, `x · Φ(x)`.
-fn gelu_erf(x: f32) -> f32 {
+pub(crate) fn gelu_erf(x: f32) -> f32 {
     let x64 = f64::from(x);
     (0.5 * x64 * erfc(-x64 / std::f64::consts::SQRT_2)) as f32
 }

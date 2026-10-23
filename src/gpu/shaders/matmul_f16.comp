@@ -1,0 +1,88 @@
+#version 460
+// y[m, n] (+)= act(x[m, k] · w[n, k]ᵀ + b): f32 rows times f16 weights, for
+// the vision tower. 64 × 64 output tiles, 256 invocations of 4 × 4 each,
+// k in steps of 16 (the host checks k % 16 == 0).
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+layout(push_constant) uniform P {
+    V4 x; U2 w; F32 b; F32 y;
+    uint m; uint n; uint k;
+    // Bit 0: add b; bit 1: GELU (tanh); bit 2: GELU (erf); bit 3: add to y.
+    uint flags;
+} p;
+
+#define TM 64
+#define TN 64
+#define TK 16
+
+shared float xs[TK][TM + 4];
+shared float ws[TK][TN + 4];
+
+// Abramowitz & Stegun 7.1.26 (error < 1.5e-7).
+float erf_(float v) {
+    float s = sign(v), a = abs(v);
+    float t = 1.0 / (1.0 + 0.3275911 * a);
+    float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-a * a);
+    return s * y;
+}
+
+float act(float v) {
+    if ((p.flags & 2u) != 0u) {
+        float u = clamp(0.7978845608 * (v + 0.044715 * v * v * v), -15.0, 15.0);
+        return 0.5 * v * (1.0 + tanh(u));
+    }
+    if ((p.flags & 4u) != 0u) return 0.5 * v * (1.0 + erf_(v * 0.7071067812));
+    return v;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint col0 = gl_WorkGroupID.x * TN, row0 = gl_WorkGroupID.y * TM;
+    uint tx = tid % 16, ty = tid / 16;
+    // Each invocation loads one row's 4 values of x and of w per step.
+    uint lr = tid / 4, lk = (tid % 4) * 4;
+    uint xr = row0 + lr, wr = col0 + lr;
+    bool xin = xr < p.m, win = wr < p.n;
+
+    float acc[4][4];
+    for (uint i = 0; i < 4; i++)
+        for (uint j = 0; j < 4; j++) acc[i][j] = 0.0;
+
+    for (uint k0 = 0; k0 < p.k; k0 += TK) {
+        vec4 xv = xin ? p.x.v[(xr * p.k + k0 + lk) / 4] : vec4(0.0);
+        vec4 wv = vec4(0.0);
+        if (win) {
+            uvec2 h = p.w.v[(wr * p.k + k0 + lk) / 4];
+            wv = vec4(unpackHalf2x16(h.x), unpackHalf2x16(h.y));
+        }
+        for (uint j = 0; j < 4; j++) {
+            xs[lk + j][lr] = xv[j];
+            ws[lk + j][lr] = wv[j];
+        }
+        barrier();
+        for (uint kk = 0; kk < TK; kk++) {
+            float a[4], c[4];
+            for (uint i = 0; i < 4; i++) a[i] = xs[kk][ty + 16 * i];
+            for (uint j = 0; j < 4; j++) c[j] = ws[kk][tx + 16 * j];
+            for (uint i = 0; i < 4; i++)
+                for (uint j = 0; j < 4; j++) acc[i][j] = fma(a[i], c[j], acc[i][j]);
+        }
+        barrier();
+    }
+
+    for (uint i = 0; i < 4; i++) {
+        uint r = row0 + ty + 16 * i;
+        if (r >= p.m) continue;
+        for (uint j = 0; j < 4; j++) {
+            uint c = col0 + tx + 16 * j;
+            if (c >= p.n) continue;
+            float v = acc[i][j];
+            if ((p.flags & 1u) != 0u) v += p.b.v[c];
+            v = act(v);
+            uint o = r * p.n + c;
+            if ((p.flags & 8u) != 0u) v += p.y.v[o];
+            p.y.v[o] = v;
+        }
+    }
+}

@@ -7,6 +7,8 @@ pub mod manager;
 pub mod model;
 pub mod monitor;
 pub mod policy;
+pub mod qwen3;
+pub mod qwen3_vision;
 pub mod vk;
 
 pub use lfm2::GpuLfm2;
